@@ -101,10 +101,20 @@ func (eps *transportEndpoints) iterEndpointsLocked(id TransportEndpointID, yield
 
 	// Try to find a match with only the local port.
 	nid.LocalAddress = ""
+	// if ep, ok := eps.endpoints[nid]; ok {
+	// 	if !yield(ep) {
+	// 		return
+	// 	}
+	// }
+
+	// Match tun2socks endpoint (listen on any ip any port).
+	if len(id.RemoteAddress) == 4 {
+		nid.LocalPort = uint16(header.IPv4ProtocolNumber)
+	} else {
+		nid.LocalPort = uint16(header.IPv6ProtocolNumber)
+	}
 	if ep, ok := eps.endpoints[nid]; ok {
-		if !yield(ep) {
-			return
-		}
+		yield(ep)
 	}
 }
 

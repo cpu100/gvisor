@@ -2865,3 +2865,7 @@ func mssForRoute(r *stack.Route) uint16 {
 	// TODO(b/143359391): Respect TCP Min and Max size.
 	return uint16(r.MTU() - header.TCPMinimumSize)
 }
+
+func TransportEndpointID(e tcpip.Endpoint) *stack.TransportEndpointID {
+	return &e.(*endpoint).ID
+}

@@ -72,7 +72,7 @@ func (s EndpointState) String() string {
 // It implements tcpip.Endpoint.
 //
 // +stateify savable
-type endpoint struct {
+type endpoint0 struct {
 	stack.TransportEndpointInfo
 
 	// The following fields are initialized at creation time and do not
@@ -151,6 +151,15 @@ type endpoint struct {
 	owner tcpip.PacketOwner
 }
 
+type endpoint struct {
+	// global properties, shared by all UDP transports.
+	*endpoint0
+	// a unshared ID is required by route finding,
+	// overwrite the global one in TransportEndpointInfo.
+	ID stack.TransportEndpointID
+	writeOptions tcpip.WriteOptions
+}
+
 // +stateify savable
 type multicastMembership struct {
 	nicID         tcpip.NICID
@@ -158,7 +167,7 @@ type multicastMembership struct {
 }
 
 func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) *endpoint {
-	return &endpoint{
+	ep0 := &endpoint0{
 		stack: s,
 		TransportEndpointInfo: stack.TransportEndpointInfo{
 			NetProto:   netProto,
@@ -184,6 +193,29 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQue
 		state:         StateInitial,
 		uniqueID:      s.UniqueID(),
 	}
+	return &endpoint{endpoint0:ep0}
+}
+
+func EndpointWithWriteOptions(e tcpip.Endpoint, id *stack.TransportEndpointID) *endpoint {
+	return &endpoint{
+		endpoint0: e.(*endpoint).endpoint0,
+		ID: *id,
+		writeOptions: tcpip.WriteOptions{
+			To: &tcpip.FullAddress{
+				NIC:  1,
+				Addr: id.RemoteAddress,
+				Port: id.RemotePort,
+			},
+		},
+	}
+}
+
+func Write(e tcpip.Endpoint, v buffer.View) (int64, <-chan struct{}, *tcpip.Error) {
+	return e.Write(tcpip.SlicePayload(v), e.(*endpoint).writeOptions)
+}
+
+func TransportEndpointID(e tcpip.Endpoint) *stack.TransportEndpointID {
+	return &e.(*endpoint).ID
 }
 
 // UniqueID implements stack.TransportEndpoint.UniqueID.
@@ -1302,8 +1334,11 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 	// Push new packet into receive list and increment the buffer size.
 	packet := &udpPacket{
 		senderAddress: tcpip.FullAddress{
-			NIC:  r.NICID(),
-			Addr: id.RemoteAddress,
+			// NIC:  r.NICID(),
+			// Addr: id.RemoteAddress,
+			// Return destination address without changing the interface.
+			NIC:  tcpip.NICID(header.UDP(hdr).DestinationPort()),
+			Addr: id.RemoteAddress + id.LocalAddress,
 			Port: header.UDP(hdr).SourcePort(),
 		},
 	}
