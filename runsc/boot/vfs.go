@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devpts"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devtmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/gofer"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/overlay"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
@@ -52,6 +53,10 @@ func registerFilesystems(ctx context.Context, vfsObj *vfs.VirtualFilesystem, cre
 	})
 	vfsObj.MustRegisterFilesystemType(gofer.Name, &gofer.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserList: true,
+	})
+	vfsObj.MustRegisterFilesystemType(overlay.Name, &overlay.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+		AllowUserList:  true,
 	})
 	vfsObj.MustRegisterFilesystemType(proc.Name, &proc.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
@@ -96,11 +101,11 @@ func setupContainerVFS2(ctx context.Context, conf *Config, mntr *containerMounte
 	procArgs.MountNamespaceVFS2 = mns
 
 	// Resolve the executable path from working dir and environment.
-	f, err := user.ResolveExecutablePathVFS2(ctx, procArgs.Credentials, procArgs.MountNamespaceVFS2, procArgs.Envv, procArgs.WorkingDirectory, procArgs.Argv[0])
+	resolved, err := user.ResolveExecutablePath(ctx, procArgs)
 	if err != nil {
-		return fmt.Errorf("searching for executable %q, cwd: %q, envv: %q: %v", procArgs.Argv[0], procArgs.WorkingDirectory, procArgs.Envv, err)
+		return err
 	}
-	procArgs.Filename = f
+	procArgs.Filename = resolved
 	return nil
 }
 

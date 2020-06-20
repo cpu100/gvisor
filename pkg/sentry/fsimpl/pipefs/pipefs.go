@@ -81,7 +81,8 @@ type inode struct {
 	kernfs.InodeNotSymlink
 	kernfs.InodeNoopRefCount
 
-	pipe *pipe.VFSPipe
+	locks vfs.FileLocks
+	pipe  *pipe.VFSPipe
 
 	ino uint64
 	uid auth.KUID
@@ -147,7 +148,7 @@ func (i *inode) SetStat(ctx context.Context, vfsfs *vfs.Filesystem, creds *auth.
 
 // Open implements kernfs.Inode.Open.
 func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	return i.pipe.Open(ctx, rp.Mount(), vfsd, opts.Flags)
+	return i.pipe.Open(ctx, rp.Mount(), vfsd, opts.Flags, &i.locks)
 }
 
 // NewConnectedPipeFDs returns a pair of FileDescriptions representing the read

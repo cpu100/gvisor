@@ -62,7 +62,7 @@ func Override() {
 	s.Table[55] = syscalls.Supported("getsockopt", GetSockOpt)
 	s.Table[59] = syscalls.Supported("execve", Execve)
 	s.Table[72] = syscalls.Supported("fcntl", Fcntl)
-	delete(s.Table, 73) // flock
+	s.Table[73] = syscalls.Supported("fcntl", Flock)
 	s.Table[74] = syscalls.Supported("fsync", Fsync)
 	s.Table[75] = syscalls.Supported("fdatasync", Fdatasync)
 	s.Table[76] = syscalls.Supported("truncate", Truncate)
@@ -105,14 +105,10 @@ func Override() {
 	s.Table[197] = syscalls.Supported("removexattr", Removexattr)
 	s.Table[198] = syscalls.Supported("lremovexattr", Lremovexattr)
 	s.Table[199] = syscalls.Supported("fremovexattr", Fremovexattr)
-	delete(s.Table, 206) // io_setup
-	delete(s.Table, 207) // io_destroy
-	delete(s.Table, 208) // io_getevents
-	delete(s.Table, 209) // io_submit
-	delete(s.Table, 210) // io_cancel
+	s.Table[209] = syscalls.PartiallySupported("io_submit", IoSubmit, "Generally supported with exceptions. User ring optimizations are not implemented.", []string{"gvisor.dev/issue/204"})
 	s.Table[213] = syscalls.Supported("epoll_create", EpollCreate)
 	s.Table[217] = syscalls.Supported("getdents64", Getdents64)
-	delete(s.Table, 221) // fdavise64
+	s.Table[221] = syscalls.PartiallySupported("fadvise64", Fadvise64, "The syscall is 'supported', but ignores all provided advice.", nil)
 	s.Table[232] = syscalls.Supported("epoll_wait", EpollWait)
 	s.Table[233] = syscalls.Supported("epoll_ctl", EpollCtl)
 	s.Table[235] = syscalls.Supported("utimes", Utimes)

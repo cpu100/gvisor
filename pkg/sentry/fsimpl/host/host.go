@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
+	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/hostfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -90,7 +91,9 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 		isTTY:      opts.IsTTY,
 		wouldBlock: wouldBlock(uint32(fileType)),
 		seekable:   seekable,
-		canMap:     canMap(uint32(fileType)),
+		// NOTE(b/38213152): Technically, some obscure char devices can be memory
+		// mapped, but we only allow regular files.
+		canMap: fileType == linux.S_IFREG,
 	}
 	i.pf.inode = i
 
@@ -181,6 +184,8 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 type inode struct {
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+
+	locks vfs.FileLocks
 
 	// When the reference count reaches zero, the host fd is closed.
 	refs.AtomicRefCount
@@ -468,16 +473,18 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags u
 			return nil, err
 		}
 		// Currently, we only allow Unix sockets to be imported.
-		return unixsocket.NewFileDescription(ep, ep.Type(), flags, mnt, d)
+		return unixsocket.NewFileDescription(ep, ep.Type(), flags, mnt, d, &i.locks)
 	}
 
-	// TODO(gvisor.dev/issue/1672): Whitelist specific file types here, so that
-	// we don't allow importing arbitrary file types without proper support.
+	// TODO(gvisor.dev/issue/1672): Allow only specific file types here, so
+	// that we don't allow importing arbitrary file types without proper
+	// support.
 	if i.isTTY {
 		fd := &TTYFileDescription{
 			fileDescription: fileDescription{inode: i},
 			termios:         linux.DefaultSlaveTermios,
 		}
+		fd.LockFD.Init(&i.locks)
 		vfsfd := &fd.vfsfd
 		if err := vfsfd.Init(fd, flags, mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
 			return nil, err
@@ -486,6 +493,7 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags u
 	}
 
 	fd := &fileDescription{inode: i}
+	fd.LockFD.Init(&i.locks)
 	vfsfd := &fd.vfsfd
 	if err := vfsfd.Init(fd, flags, mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
@@ -497,6 +505,7 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags u
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
+	vfs.LockFD
 
 	// inode is vfsfd.Dentry().Impl().(*kernfs.Dentry).Inode().(*inode), but
 	// cached to reduce indirections and casting. fileDescription does not hold
@@ -682,7 +691,8 @@ func (f *fileDescription) Seek(_ context.Context, offset int64, whence int32) (i
 
 // Sync implements FileDescriptionImpl.
 func (f *fileDescription) Sync(context.Context) error {
-	// TODO(gvisor.dev/issue/1672): Currently we do not support the SyncData optimization, so we always sync everything.
+	// TODO(gvisor.dev/issue/1672): Currently we do not support the SyncData
+	//  optimization, so we always sync everything.
 	return unix.Fsync(f.inode.hostFD)
 }
 
@@ -711,4 +721,14 @@ func (f *fileDescription) EventUnregister(e *waiter.Entry) {
 // Readiness uses the poll() syscall to check the status of the underlying FD.
 func (f *fileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return fdnotifier.NonBlockingPoll(int32(f.inode.hostFD), mask)
+}
+
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (f *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+	return f.Locks().LockPOSIX(ctx, &f.vfsfd, uid, t, start, length, whence, block)
+}
+
+// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
+func (f *fileDescription) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
+	return f.Locks().UnlockPOSIX(ctx, &f.vfsfd, uid, start, length, whence)
 }

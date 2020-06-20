@@ -98,8 +98,10 @@ type dir struct {
 	kernfs.InodeNoDynamicLookup
 	kernfs.InodeNotSymlink
 	kernfs.InodeDirectoryNoNewChildren
-
 	kernfs.OrderedChildren
+
+	locks vfs.FileLocks
+
 	dentry kernfs.Dentry
 }
 
@@ -121,7 +123,7 @@ func (*dir) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.Set
 
 // Open implements kernfs.Inode.Open.
 func (d *dir) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &d.OrderedChildren, &opts)
+	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &d.OrderedChildren, &d.locks, &opts)
 	if err != nil {
 		return nil, err
 	}

@@ -79,7 +79,7 @@ afterSymlink:
 	}
 	if symlink, ok := child.inode.impl.(*symlink); ok && rp.ShouldFollowSymlink() {
 		// Symlink traversal updates access time.
-		atomic.StoreInt64(&d.inode.atime, d.inode.fs.clock.Now().Nanoseconds())
+		child.inode.touchAtime(rp.Mount())
 		if err := rp.HandleSymlink(symlink.target); err != nil {
 			return nil, err
 		}
@@ -237,18 +237,22 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 			return syserror.EXDEV
 		}
 		d := vd.Dentry().Impl().(*dentry)
-		if d.inode.isDir() {
+		i := d.inode
+		if i.isDir() {
 			return syserror.EPERM
 		}
-		if d.inode.nlink == 0 {
+		if err := vfs.MayLink(auth.CredentialsFromContext(ctx), linux.FileMode(atomic.LoadUint32(&i.mode)), auth.KUID(atomic.LoadUint32(&i.uid)), auth.KGID(atomic.LoadUint32(&i.gid))); err != nil {
+			return err
+		}
+		if i.nlink == 0 {
 			return syserror.ENOENT
 		}
-		if d.inode.nlink == maxLinks {
+		if i.nlink == maxLinks {
 			return syserror.EMLINK
 		}
-		d.inode.incLinksLocked()
-		d.inode.watches.Notify("", linux.IN_ATTRIB, 0, vfs.InodeEvent)
-		parentDir.insertChildLocked(fs.newDentry(d.inode), name)
+		i.incLinksLocked()
+		i.watches.Notify("", linux.IN_ATTRIB, 0, vfs.InodeEvent)
+		parentDir.insertChildLocked(fs.newDentry(i), name)
 		return nil
 	})
 }
@@ -368,6 +372,9 @@ afterTrailingSymlink:
 		parentDir.inode.touchCMtime()
 		return fd, nil
 	}
+	if mustCreate {
+		return nil, syserror.EEXIST
+	}
 	// Is the file mounted over?
 	if err := rp.CheckMount(&child.vfsd); err != nil {
 		return nil, err
@@ -375,7 +382,7 @@ afterTrailingSymlink:
 	// Do we need to resolve a trailing symlink?
 	if symlink, ok := child.inode.impl.(*symlink); ok && rp.ShouldFollowSymlink() {
 		// Symlink traversal updates access time.
-		atomic.StoreInt64(&child.inode.atime, child.inode.fs.clock.Now().Nanoseconds())
+		child.inode.touchAtime(rp.Mount())
 		if err := rp.HandleSymlink(symlink.target); err != nil {
 			return nil, err
 		}
@@ -399,6 +406,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	switch impl := d.inode.impl.(type) {
 	case *regularFile:
 		var fd regularFileFD
+		fd.LockFD.Init(&d.inode.locks)
 		if err := fd.vfsfd.Init(&fd, opts.Flags, rp.Mount(), &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
 			return nil, err
 		}
@@ -414,15 +422,16 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			return nil, syserror.EISDIR
 		}
 		var fd directoryFD
+		fd.LockFD.Init(&d.inode.locks)
 		if err := fd.vfsfd.Init(&fd, opts.Flags, rp.Mount(), &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
 			return nil, err
 		}
 		return &fd.vfsfd, nil
 	case *symlink:
-		// Can't open symlinks without O_PATH (which is unimplemented).
+		// TODO(gvisor.dev/issue/2782): Can't open symlinks without O_PATH.
 		return nil, syserror.ELOOP
 	case *namedPipe:
-		return impl.pipe.Open(ctx, rp.Mount(), &d.vfsd, opts.Flags)
+		return impl.pipe.Open(ctx, rp.Mount(), &d.vfsd, opts.Flags, &d.inode.locks)
 	case *deviceFile:
 		return rp.VirtualFilesystem().OpenDeviceSpecialFile(ctx, rp.Mount(), &d.vfsd, impl.kind, impl.major, impl.minor, opts)
 	case *socketFile:

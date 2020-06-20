@@ -118,7 +118,7 @@ func putDentrySlice(ds *[]*dentry) {
 // must be up to date.
 //
 // Postconditions: The returned dentry's cached metadata is up to date.
-func (fs *filesystem) stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry, ds **[]*dentry) (*dentry, error) {
+func (fs *filesystem) stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry, mayFollowSymlinks bool, ds **[]*dentry) (*dentry, error) {
 	if !d.isDir() {
 		return nil, syserror.ENOTDIR
 	}
@@ -168,7 +168,7 @@ afterSymlink:
 	if err := rp.CheckMount(&child.vfsd); err != nil {
 		return nil, err
 	}
-	if child.isSymlink() && rp.ShouldFollowSymlink() {
+	if child.isSymlink() && mayFollowSymlinks && rp.ShouldFollowSymlink() {
 		target, err := child.readlink(ctx, rp.Mount())
 		if err != nil {
 			return nil, err
@@ -275,7 +275,7 @@ func (fs *filesystem) revalidateChildLocked(ctx context.Context, vfsObj *vfs.Vir
 func (fs *filesystem) walkParentDirLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry, ds **[]*dentry) (*dentry, error) {
 	for !rp.Final() {
 		d.dirMu.Lock()
-		next, err := fs.stepLocked(ctx, rp, d, ds)
+		next, err := fs.stepLocked(ctx, rp, d, true /* mayFollowSymlinks */, ds)
 		d.dirMu.Unlock()
 		if err != nil {
 			return nil, err
@@ -301,7 +301,7 @@ func (fs *filesystem) resolveLocked(ctx context.Context, rp *vfs.ResolvingPath, 
 	}
 	for !rp.Done() {
 		d.dirMu.Lock()
-		next, err := fs.stepLocked(ctx, rp, d, ds)
+		next, err := fs.stepLocked(ctx, rp, d, true /* mayFollowSymlinks */, ds)
 		d.dirMu.Unlock()
 		if err != nil {
 			return nil, err
@@ -374,13 +374,16 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 		return nil
 	}
 	if fs.opts.interop == InteropModeShared {
-		// The existence of a dentry at name would be inconclusive because the
-		// file it represents may have been deleted from the remote filesystem,
-		// so we would need to make an RPC to revalidate the dentry. Just
-		// attempt the file creation RPC instead. If a file does exist, the RPC
-		// will fail with EEXIST like we would have. If the RPC succeeds, and a
-		// stale dentry exists, the dentry will fail revalidation next time
-		// it's used.
+		if child := parent.children[name]; child != nil && child.isSynthetic() {
+			return syserror.EEXIST
+		}
+		// The existence of a non-synthetic dentry at name would be inconclusive
+		// because the file it represents may have been deleted from the remote
+		// filesystem, so we would need to make an RPC to revalidate the dentry.
+		// Just attempt the file creation RPC instead. If a file does exist, the
+		// RPC will fail with EEXIST like we would have. If the RPC succeeds, and a
+		// stale dentry exists, the dentry will fail revalidation next time it's
+		// used.
 		return createInRemoteDir(parent, name)
 	}
 	if child := parent.children[name]; child != nil {
@@ -518,7 +521,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		if child == nil {
 			return syserror.ENOENT
 		}
-	} else {
+	} else if child == nil || !child.isSynthetic() {
 		err = parent.file.unlinkAt(ctx, name, flags)
 		if err != nil {
 			if child != nil {
@@ -754,7 +757,7 @@ afterTrailingSymlink:
 	}
 	// Determine whether or not we need to create a file.
 	parent.dirMu.Lock()
-	child, err := fs.stepLocked(ctx, rp, parent, &ds)
+	child, err := fs.stepLocked(ctx, rp, parent, false /* mayFollowSymlinks */, &ds)
 	if err == syserror.ENOENT && mayCreate {
 		if parent.isSynthetic() {
 			parent.dirMu.Unlock()
@@ -801,6 +804,7 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 				return nil, err
 			}
 			fd := &regularFileFD{}
+			fd.LockFD.Init(&d.locks)
 			if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &d.vfsd, &vfs.FileDescriptionOptions{
 				AllowDirectIO: true,
 			}); err != nil {
@@ -826,6 +830,7 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 			}
 		}
 		fd := &directoryFD{}
+		fd.LockFD.Init(&d.locks)
 		if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
 			return nil, err
 		}
@@ -842,7 +847,7 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 		}
 	case linux.S_IFIFO:
 		if d.isSynthetic() {
-			return d.pipe.Open(ctx, mnt, &d.vfsd, opts.Flags)
+			return d.pipe.Open(ctx, mnt, &d.vfsd, opts.Flags, &d.locks)
 		}
 	}
 	return d.openSpecialFileLocked(ctx, mnt, opts)
@@ -902,7 +907,7 @@ retry:
 			return nil, err
 		}
 	}
-	fd, err := newSpecialFileFD(h, mnt, d, opts.Flags)
+	fd, err := newSpecialFileFD(h, mnt, d, &d.locks, opts.Flags)
 	if err != nil {
 		h.close(ctx)
 		return nil, err
@@ -937,7 +942,7 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	// Filter file creation flags and O_LARGEFILE out; the create RPC already
 	// has the semantics of O_CREAT|O_EXCL, while some servers will choke on
 	// O_LARGEFILE.
-	createFlags := p9.OpenFlags(opts.Flags &^ (linux.O_CREAT | linux.O_EXCL | linux.O_NOCTTY | linux.O_TRUNC | linux.O_LARGEFILE))
+	createFlags := p9.OpenFlags(opts.Flags &^ (vfs.FileCreationFlags | linux.O_LARGEFILE))
 	fdobj, openFile, createQID, _, err := dirfile.create(ctx, name, createFlags, (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID))
 	if err != nil {
 		dirfile.close(ctx)
@@ -989,6 +994,7 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	var childVFSFD *vfs.FileDescription
 	if useRegularFileFD {
 		fd := &regularFileFD{}
+		fd.LockFD.Init(&child.locks)
 		if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &child.vfsd, &vfs.FileDescriptionOptions{
 			AllowDirectIO: true,
 		}); err != nil {
@@ -1003,7 +1009,7 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 		if fdobj != nil {
 			h.fd = int32(fdobj.Release())
 		}
-		fd, err := newSpecialFileFD(h, mnt, child, opts.Flags)
+		fd, err := newSpecialFileFD(h, mnt, child, &d.locks, opts.Flags)
 		if err != nil {
 			h.close(ctx)
 			return nil, err
@@ -1190,7 +1196,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if newParent.cachedMetadataAuthoritative() {
 		newParent.dirents = nil
 		newParent.touchCMtime()
-		if renamed.isDir() {
+		if renamed.isDir() && (replaced == nil || !replaced.isDir()) {
+			// Increase the link count if we did not replace another directory.
 			newParent.incLinks()
 		}
 	}

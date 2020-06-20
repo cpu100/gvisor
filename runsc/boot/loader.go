@@ -754,6 +754,21 @@ func (l *Loader) startContainer(spec *specs.Spec, conf *Config, cid string, file
 		return err
 	}
 
+	// Add the HOME enviroment variable if it is not already set.
+	var envv []string
+	if kernel.VFS2Enabled {
+		envv, err = user.MaybeAddExecUserHomeVFS2(ctx, procArgs.MountNamespaceVFS2,
+			procArgs.Credentials.RealKUID, procArgs.Envv)
+
+	} else {
+		envv, err = user.MaybeAddExecUserHome(ctx, procArgs.MountNamespace,
+			procArgs.Credentials.RealKUID, procArgs.Envv)
+	}
+	if err != nil {
+		return err
+	}
+	procArgs.Envv = envv
+
 	// Create and start the new process.
 	tg, _, err := l.k.CreateProcess(procArgs)
 	if err != nil {
@@ -1043,8 +1058,8 @@ func newEmptySandboxNetworkStack(clock tcpip.Clock, uniqueID stack.UniqueID) (in
 	})}
 
 	// Enable SACK Recovery.
-	if err := s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(true)); err != nil {
-		return nil, fmt.Errorf("failed to enable SACK: %v", err)
+	if err := s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, tcpip.StackSACKEnabled(true)); err != nil {
+		return nil, fmt.Errorf("failed to enable SACK: %s", err)
 	}
 
 	// Set default TTLs as required by socket/netstack.
@@ -1053,10 +1068,8 @@ func newEmptySandboxNetworkStack(clock tcpip.Clock, uniqueID stack.UniqueID) (in
 
 	// Enable Receive Buffer Auto-Tuning.
 	if err := s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, tcpip.ModerateReceiveBufferOption(true)); err != nil {
-		return nil, fmt.Errorf("SetTransportProtocolOption failed: %v", err)
+		return nil, fmt.Errorf("SetTransportProtocolOption failed: %s", err)
 	}
-
-	s.FillIPTablesMetadata()
 
 	return &s, nil
 }

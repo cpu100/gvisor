@@ -45,6 +45,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
+	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
@@ -662,6 +663,8 @@ type dentry struct {
 	// If this dentry represents a synthetic named pipe, pipe is the pipe
 	// endpoint bound to this file.
 	pipe *pipe.VFSPipe
+
+	locks vfs.FileLocks
 }
 
 // dentryAttrMask returns a p9.AttrMask enabling all attributes used by the
@@ -831,6 +834,14 @@ func (d *dentry) statTo(stat *linux.Statx) {
 	stat.Mask = linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_NLINK | linux.STATX_UID | linux.STATX_GID | linux.STATX_ATIME | linux.STATX_MTIME | linux.STATX_CTIME | linux.STATX_INO | linux.STATX_SIZE | linux.STATX_BLOCKS | linux.STATX_BTIME
 	stat.Blksize = atomic.LoadUint32(&d.blockSize)
 	stat.Nlink = atomic.LoadUint32(&d.nlink)
+	if stat.Nlink == 0 {
+		// The remote filesystem doesn't support link count; just make
+		// something up. This is consistent with Linux, where
+		// fs/inode.c:inode_init_always() initializes link count to 1, and
+		// fs/9p/vfs_inode_dotl.c:v9fs_stat2inode_dotl() doesn't touch it if
+		// it's not provided by the remote filesystem.
+		stat.Nlink = 1
+	}
 	stat.UID = atomic.LoadUint32(&d.uid)
 	stat.GID = atomic.LoadUint32(&d.gid)
 	stat.Mode = uint16(atomic.LoadUint32(&d.mode))
@@ -1342,23 +1353,21 @@ func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool
 }
 
 // incLinks increments link count.
-//
-// Preconditions: d.nlink != 0 && d.nlink < math.MaxUint32.
 func (d *dentry) incLinks() {
-	v := atomic.AddUint32(&d.nlink, 1)
-	if v < 2 {
-		panic(fmt.Sprintf("dentry.nlink is invalid (was 0 or overflowed): %d", v))
+	if atomic.LoadUint32(&d.nlink) == 0 {
+		// The remote filesystem doesn't support link count.
+		return
 	}
+	atomic.AddUint32(&d.nlink, 1)
 }
 
 // decLinks decrements link count.
-//
-// Preconditions: d.nlink > 1.
 func (d *dentry) decLinks() {
-	v := atomic.AddUint32(&d.nlink, ^uint32(0))
-	if v == 0 {
-		panic(fmt.Sprintf("dentry.nlink must be greater than 0: %d", v))
+	if atomic.LoadUint32(&d.nlink) == 0 {
+		// The remote filesystem doesn't support link count.
+		return
 	}
+	atomic.AddUint32(&d.nlink, ^uint32(0))
 }
 
 // fileDescription is embedded by gofer implementations of
@@ -1366,6 +1375,9 @@ func (d *dentry) decLinks() {
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
+	vfs.LockFD
+
+	lockLogging sync.Once
 }
 
 func (fd *fileDescription) filesystem() *filesystem {
@@ -1415,4 +1427,25 @@ func (fd *fileDescription) Setxattr(ctx context.Context, opts vfs.SetxattrOption
 // Removexattr implements vfs.FileDescriptionImpl.Removexattr.
 func (fd *fileDescription) Removexattr(ctx context.Context, name string) error {
 	return fd.dentry().removexattr(ctx, auth.CredentialsFromContext(ctx), name)
+}
+
+// LockBSD implements vfs.FileDescriptionImpl.LockBSD.
+func (fd *fileDescription) LockBSD(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, block fslock.Blocker) error {
+	fd.lockLogging.Do(func() {
+		log.Infof("File lock using gofer file handled internally.")
+	})
+	return fd.LockFD.LockBSD(ctx, uid, t, block)
+}
+
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+	fd.lockLogging.Do(func() {
+		log.Infof("Range lock using gofer file handled internally.")
+	})
+	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
+}
+
+// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
+func (fd *fileDescription) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
+	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
 }

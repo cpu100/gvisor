@@ -41,7 +41,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sentry/vfs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/vfs/memxattr"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
@@ -311,8 +310,7 @@ type inode struct {
 	ctime int64 // nanoseconds
 	mtime int64 // nanoseconds
 
-	// Advisory file locks, which lock at the inode level.
-	locks lock.FileLocks
+	locks vfs.FileLocks
 
 	// Inotify watches for this inode.
 	watches vfs.Watches
@@ -539,44 +537,6 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, stat *linu
 	return nil
 }
 
-// TODO(gvisor.dev/issue/1480): support file locking for file types other than regular.
-func (i *inode) lockBSD(uid fslock.UniqueID, t fslock.LockType, block fslock.Blocker) error {
-	switch i.impl.(type) {
-	case *regularFile:
-		return i.locks.LockBSD(uid, t, block)
-	}
-	return syserror.EBADF
-}
-
-// TODO(gvisor.dev/issue/1480): support file locking for file types other than regular.
-func (i *inode) unlockBSD(uid fslock.UniqueID) error {
-	switch i.impl.(type) {
-	case *regularFile:
-		i.locks.UnlockBSD(uid)
-		return nil
-	}
-	return syserror.EBADF
-}
-
-// TODO(gvisor.dev/issue/1480): support file locking for file types other than regular.
-func (i *inode) lockPOSIX(uid fslock.UniqueID, t fslock.LockType, rng fslock.LockRange, block fslock.Blocker) error {
-	switch i.impl.(type) {
-	case *regularFile:
-		return i.locks.LockPOSIX(uid, t, rng, block)
-	}
-	return syserror.EBADF
-}
-
-// TODO(gvisor.dev/issue/1480): support file locking for file types other than regular.
-func (i *inode) unlockPOSIX(uid fslock.UniqueID, rng fslock.LockRange) error {
-	switch i.impl.(type) {
-	case *regularFile:
-		i.locks.UnlockPOSIX(uid, rng)
-		return nil
-	}
-	return syserror.EBADF
-}
-
 // allocatedBlocksForSize returns the number of 512B blocks needed to
 // accommodate the given size in bytes, as appropriate for struct
 // stat::st_blocks and struct statx::stx_blocks. (Note that this 512B block
@@ -708,6 +668,7 @@ func (i *inode) userXattrSupported() bool {
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
+	vfs.LockFD
 }
 
 func (fd *fileDescription) filesystem() *filesystem {
@@ -800,9 +761,26 @@ func NewMemfd(mount *vfs.Mount, creds *auth.Credentials, allowSeals bool, name s
 	// Per Linux, mm/shmem.c:__shmem_file_setup(), memfd files are set up with
 	// FMODE_READ | FMODE_WRITE.
 	var fd regularFileFD
+	fd.Init(&inode.locks)
 	flags := uint32(linux.O_RDWR)
 	if err := fd.vfsfd.Init(&fd, flags, mount, &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
 	}
 	return &fd.vfsfd, nil
+}
+
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
+}
+
+// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
+func (fd *fileDescription) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
+	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
+}
+
+// Sync implements vfs.FileDescriptionImpl.Sync. It does nothing because all
+// filesystem state is in-memory.
+func (*fileDescription) Sync(context.Context) error {
+	return nil
 }

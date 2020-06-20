@@ -555,6 +555,8 @@ type StaticDirectory struct {
 	InodeAttrs
 	InodeNoDynamicLookup
 	OrderedChildren
+
+	locks vfs.FileLocks
 }
 
 var _ Inode = (*StaticDirectory)(nil)
@@ -584,7 +586,7 @@ func (s *StaticDirectory) Init(creds *auth.Credentials, devMajor, devMinor uint3
 
 // Open implements kernfs.Inode.
 func (s *StaticDirectory) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := NewGenericDirectoryFD(rp.Mount(), vfsd, &s.OrderedChildren, &opts)
+	fd, err := NewGenericDirectoryFD(rp.Mount(), vfsd, &s.OrderedChildren, &s.locks, &opts)
 	if err != nil {
 		return nil, err
 	}

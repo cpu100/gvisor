@@ -37,6 +37,8 @@ type subtasksInode struct {
 	kernfs.OrderedChildren
 	kernfs.AlwaysValid
 
+	locks vfs.FileLocks
+
 	fs                *filesystem
 	task              *kernel.Task
 	pidns             *kernel.PIDNamespace
@@ -153,7 +155,7 @@ func (fd *subtasksFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) erro
 // Open implements kernfs.Inode.
 func (i *subtasksInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd := &subtasksFD{task: i.task}
-	if err := fd.Init(&i.OrderedChildren, &opts); err != nil {
+	if err := fd.Init(&i.OrderedChildren, &i.locks, &opts); err != nil {
 		return nil, err
 	}
 	if err := fd.VFSFileDescription().Init(fd, opts.Flags, rp.Mount(), vfsd, &vfs.FileDescriptionOptions{}); err != nil {

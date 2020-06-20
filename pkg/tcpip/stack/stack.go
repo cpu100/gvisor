@@ -1017,6 +1017,13 @@ func (s *Stack) RemoveNIC(id tcpip.NICID) *tcpip.Error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	return s.removeNICLocked(id)
+}
+
+// removeNICLocked removes NIC and all related routes from the network stack.
+//
+// s.mu must be locked.
+func (s *Stack) removeNICLocked(id tcpip.NICID) *tcpip.Error {
 	nic, ok := s.nics[id]
 	if !ok {
 		return tcpip.ErrUnknownNICID
@@ -1026,14 +1033,14 @@ func (s *Stack) RemoveNIC(id tcpip.NICID) *tcpip.Error {
 	// Remove routes in-place. n tracks the number of routes written.
 	n := 0
 	for i, r := range s.routeTable {
+		s.routeTable[i] = tcpip.Route{}
 		if r.NIC != id {
 			// Keep this route.
-			if i > n {
-				s.routeTable[n] = r
-			}
+			s.routeTable[n] = r
 			n++
 		}
 	}
+
 	s.routeTable = s.routeTable[:n]
 
 	return nic.remove()
@@ -1397,25 +1404,25 @@ func (s *Stack) RemoveWaker(nicID tcpip.NICID, addr tcpip.Address, waker *sleep.
 // transport dispatcher. Received packets that match the provided id will be
 // delivered to the given endpoint; specifying a nic is optional, but
 // nic-specific IDs have precedence over global ones.
-func (s *Stack) RegisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID, ep TransportEndpoint, reusePort bool, bindToDevice tcpip.NICID) *tcpip.Error {
-	return s.demux.registerEndpoint(netProtos, protocol, id, ep, reusePort, bindToDevice)
+func (s *Stack) RegisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID, ep TransportEndpoint, flags ports.Flags, bindToDevice tcpip.NICID) *tcpip.Error {
+	return s.demux.registerEndpoint(netProtos, protocol, id, ep, flags, bindToDevice)
 }
 
 // UnregisterTransportEndpoint removes the endpoint with the given id from the
 // stack transport dispatcher.
-func (s *Stack) UnregisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID, ep TransportEndpoint, bindToDevice tcpip.NICID) {
-	s.demux.unregisterEndpoint(netProtos, protocol, id, ep, bindToDevice)
+func (s *Stack) UnregisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID, ep TransportEndpoint, flags ports.Flags, bindToDevice tcpip.NICID) {
+	s.demux.unregisterEndpoint(netProtos, protocol, id, ep, flags, bindToDevice)
 }
 
 // StartTransportEndpointCleanup removes the endpoint with the given id from
 // the stack transport dispatcher. It also transitions it to the cleanup stage.
-func (s *Stack) StartTransportEndpointCleanup(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID, ep TransportEndpoint, bindToDevice tcpip.NICID) {
+func (s *Stack) StartTransportEndpointCleanup(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID, ep TransportEndpoint, flags ports.Flags, bindToDevice tcpip.NICID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.cleanupEndpoints[ep] = struct{}{}
 
-	s.demux.unregisterEndpoint(netProtos, protocol, id, ep, bindToDevice)
+	s.demux.unregisterEndpoint(netProtos, protocol, id, ep, flags, bindToDevice)
 }
 
 // CompleteTransportEndpointCleanup removes the endpoint from the cleanup

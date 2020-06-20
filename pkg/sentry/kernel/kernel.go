@@ -194,11 +194,6 @@ type Kernel struct {
 	// cpuClockTickerSetting is protected by runningTasksMu.
 	cpuClockTickerSetting ktime.Setting
 
-	// fdMapUids is an ever-increasing counter for generating FDTable uids.
-	//
-	// fdMapUids is mutable, and is accessed using atomic memory operations.
-	fdMapUids uint64
-
 	// uniqueID is used to generate unique identifiers.
 	//
 	// uniqueID is mutable, and is accessed using atomic memory operations.
@@ -457,9 +452,7 @@ func (k *Kernel) SaveTo(w io.Writer) error {
 		return err
 	}
 
-	// Ensure that all pending asynchronous work is complete:
-	//   - inode and mount release
-	//   - asynchronuous IO
+	// Ensure that all inode and mount release operations have completed.
 	fs.AsyncBarrier()
 
 	// Once all fs work has completed (flushed references have all been released),
@@ -897,7 +890,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		if mntnsVFS2 == nil {
 			// MountNamespaceVFS2 adds a reference to the namespace, which is
 			// transferred to the new process.
-			mntnsVFS2 = k.GlobalInit().Leader().MountNamespaceVFS2()
+			mntnsVFS2 = k.globalInit.Leader().MountNamespaceVFS2()
 		}
 		// Get the root directory from the MountNamespace.
 		root := args.MountNamespaceVFS2.Root()
@@ -1254,13 +1247,15 @@ func (k *Kernel) Kill(es ExitStatus) {
 }
 
 // Pause requests that all tasks in k temporarily stop executing, and blocks
-// until all tasks in k have stopped. Multiple calls to Pause nest and require
-// an equal number of calls to Unpause to resume execution.
+// until all tasks and asynchronous I/O operations in k have stopped. Multiple
+// calls to Pause nest and require an equal number of calls to Unpause to
+// resume execution.
 func (k *Kernel) Pause() {
 	k.extMu.Lock()
 	k.tasks.BeginExternalStop()
 	k.extMu.Unlock()
 	k.tasks.runningGoroutines.Wait()
+	k.tasks.aioGoroutines.Wait()
 }
 
 // Unpause ends the effect of a previous call to Pause. If Unpause is called
