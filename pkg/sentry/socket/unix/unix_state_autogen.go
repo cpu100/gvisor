@@ -6,62 +6,86 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *SocketOperations) StateTypeName() string {
-	return "pkg/sentry/socket/unix.SocketOperations"
+func (r *socketRefs) StateTypeName() string {
+	return "pkg/sentry/socket/unix.socketRefs"
 }
 
-func (x *SocketOperations) StateFields() []string {
+func (r *socketRefs) StateFields() []string {
 	return []string{
-		"socketOpsCommon",
+		"refCount",
 	}
 }
 
-func (x *SocketOperations) beforeSave() {}
+func (r *socketRefs) beforeSave() {}
 
-func (x *SocketOperations) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.socketOpsCommon)
+// +checklocksignore
+func (r *socketRefs) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.refCount)
 }
 
-func (x *SocketOperations) afterLoad() {}
-
-func (x *SocketOperations) StateLoad(m state.Source) {
-	m.Load(0, &x.socketOpsCommon)
+// +checklocksignore
+func (r *socketRefs) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.refCount)
+	stateSourceObject.AfterLoad(r.afterLoad)
 }
 
-func (x *socketOpsCommon) StateTypeName() string {
-	return "pkg/sentry/socket/unix.socketOpsCommon"
+func (s *Socket) StateTypeName() string {
+	return "pkg/sentry/socket/unix.Socket"
 }
 
-func (x *socketOpsCommon) StateFields() []string {
+func (s *Socket) StateFields() []string {
 	return []string{
-		"AtomicRefCount",
+		"vfsfd",
+		"FileDescriptionDefaultImpl",
+		"DentryMetadataFileDescriptionImpl",
+		"LockFD",
 		"SendReceiveTimeout",
+		"socketRefs",
+		"namespace",
 		"ep",
 		"stype",
+		"abstractName",
+		"abstractBound",
 	}
 }
 
-func (x *socketOpsCommon) beforeSave() {}
+func (s *Socket) beforeSave() {}
 
-func (x *socketOpsCommon) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.AtomicRefCount)
-	m.Save(1, &x.SendReceiveTimeout)
-	m.Save(2, &x.ep)
-	m.Save(3, &x.stype)
+// +checklocksignore
+func (s *Socket) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.vfsfd)
+	stateSinkObject.Save(1, &s.FileDescriptionDefaultImpl)
+	stateSinkObject.Save(2, &s.DentryMetadataFileDescriptionImpl)
+	stateSinkObject.Save(3, &s.LockFD)
+	stateSinkObject.Save(4, &s.SendReceiveTimeout)
+	stateSinkObject.Save(5, &s.socketRefs)
+	stateSinkObject.Save(6, &s.namespace)
+	stateSinkObject.Save(7, &s.ep)
+	stateSinkObject.Save(8, &s.stype)
+	stateSinkObject.Save(9, &s.abstractName)
+	stateSinkObject.Save(10, &s.abstractBound)
 }
 
-func (x *socketOpsCommon) afterLoad() {}
+func (s *Socket) afterLoad() {}
 
-func (x *socketOpsCommon) StateLoad(m state.Source) {
-	m.Load(0, &x.AtomicRefCount)
-	m.Load(1, &x.SendReceiveTimeout)
-	m.Load(2, &x.ep)
-	m.Load(3, &x.stype)
+// +checklocksignore
+func (s *Socket) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.vfsfd)
+	stateSourceObject.Load(1, &s.FileDescriptionDefaultImpl)
+	stateSourceObject.Load(2, &s.DentryMetadataFileDescriptionImpl)
+	stateSourceObject.Load(3, &s.LockFD)
+	stateSourceObject.Load(4, &s.SendReceiveTimeout)
+	stateSourceObject.Load(5, &s.socketRefs)
+	stateSourceObject.Load(6, &s.namespace)
+	stateSourceObject.Load(7, &s.ep)
+	stateSourceObject.Load(8, &s.stype)
+	stateSourceObject.Load(9, &s.abstractName)
+	stateSourceObject.Load(10, &s.abstractBound)
 }
 
 func init() {
-	state.Register((*SocketOperations)(nil))
-	state.Register((*socketOpsCommon)(nil))
+	state.Register((*socketRefs)(nil))
+	state.Register((*Socket)(nil))
 }

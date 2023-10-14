@@ -18,6 +18,7 @@ package devtmpfs
 
 import (
 	"fmt"
+	"path"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -32,8 +33,10 @@ import (
 const Name = "devtmpfs"
 
 // FilesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type FilesystemType struct {
-	initOnce sync.Once
+	initOnce sync.Once `state:"nosave"` // FIXME(gvisor.dev/issue/1663): not yet supported.
 	initErr  error
 
 	// fs is the tmpfs filesystem that backs all mounts of this FilesystemType.
@@ -68,6 +71,15 @@ func (fst *FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virtua
 	return fst.fs, fst.root, nil
 }
 
+// Release implements vfs.FilesystemType.Release.
+func (fst *FilesystemType) Release(ctx context.Context) {
+	if fst.fs != nil {
+		// Release the original reference obtained when creating the filesystem.
+		fst.root.DecRef(ctx)
+		fst.fs.DecRef(ctx)
+	}
+}
+
 // Accessor allows devices to create device special files in devtmpfs.
 type Accessor struct {
 	vfsObj *vfs.VirtualFilesystem
@@ -79,22 +91,24 @@ type Accessor struct {
 // NewAccessor returns an Accessor that supports creation of device special
 // files in the devtmpfs instance registered with name fsTypeName in vfsObj.
 func NewAccessor(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, fsTypeName string) (*Accessor, error) {
-	mntns, err := vfsObj.NewMountNamespace(ctx, creds, "devtmpfs" /* source */, fsTypeName, &vfs.GetFilesystemOptions{})
+	mntns, err := vfsObj.NewMountNamespace(ctx, creds, "devtmpfs" /* source */, fsTypeName, &vfs.MountOptions{}, nil)
 	if err != nil {
 		return nil, err
 	}
+	// Pass a reference on root to the Accessor.
+	root := mntns.Root(ctx)
 	return &Accessor{
 		vfsObj: vfsObj,
 		mntns:  mntns,
-		root:   mntns.Root(),
+		root:   root,
 		creds:  creds,
 	}, nil
 }
 
 // Release must be called when a is no longer in use.
-func (a *Accessor) Release() {
-	a.root.DecRef()
-	a.mntns.DecRef()
+func (a *Accessor) Release(ctx context.Context) {
+	a.root.DecRef(ctx)
+	a.mntns.DecRef(ctx)
 }
 
 // accessorContext implements context.Context by extending an existing
@@ -112,7 +126,7 @@ func (a *Accessor) wrapContext(ctx context.Context) *accessorContext {
 }
 
 // Value implements context.Context.Value.
-func (ac *accessorContext) Value(key interface{}) interface{} {
+func (ac *accessorContext) Value(key any) any {
 	switch key {
 	case vfs.CtxMountNamespace:
 		ac.a.mntns.IncRef()
@@ -150,13 +164,11 @@ func (a *Accessor) CreateDeviceFile(ctx context.Context, pathname string, kind v
 
 	// Create any parent directories. See
 	// devtmpfs.c:handle_create()=>path_create().
-	for it := fspath.Parse(pathname).Begin; it.NextOk(); it = it.Next() {
-		pop := a.pathOperationAt(it.String())
-		if err := a.vfsObj.MkdirAt(actx, a.creds, pop, &vfs.MkdirOptions{
-			Mode: 0755,
-		}); err != nil {
-			return fmt.Errorf("failed to create directory %q: %v", it.String(), err)
-		}
+	parent := path.Dir(pathname)
+	if err := a.vfsObj.MkdirAllAt(ctx, parent, a.root, a.creds, &vfs.MkdirOptions{
+		Mode: 0755,
+	}, true /* mustBeDir */); err != nil {
+		return fmt.Errorf("failed to create device parent directory %q: %v", parent, err)
 	}
 
 	// NOTE: Linux's devtmpfs refuses to automatically delete files it didn't

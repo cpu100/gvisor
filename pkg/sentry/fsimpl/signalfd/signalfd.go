@@ -12,26 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package signalfd provides basic signalfd file implementations.
 package signalfd
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// SignalFileDescription implements FileDescriptionImpl for signal fds.
+// SignalFileDescription implements vfs.FileDescriptionImpl for signal fds.
+//
+// +stateify savable
 type SignalFileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
+	vfs.NoAsyncEventFD
 
 	// target is the original signal target task.
 	//
@@ -42,11 +45,14 @@ type SignalFileDescription struct {
 	// will undoubtedly become very complicated quickly.
 	target *kernel.Task
 
-	// mu protects mask.
-	mu sync.Mutex
+	// queue is the queue for listeners.
+	queue waiter.Queue
 
-	// mask is the signal mask. Protected by mu.
-	mask linux.SignalSet
+	// mu protects entry.
+	mu sync.Mutex `state:"nosave"`
+
+	// entry is the entry in the task signal queue.
+	entry waiter.Entry
 }
 
 var _ vfs.FileDescriptionImpl = (*SignalFileDescription)(nil)
@@ -54,16 +60,18 @@ var _ vfs.FileDescriptionImpl = (*SignalFileDescription)(nil)
 // New creates a new signal fd.
 func New(vfsObj *vfs.VirtualFilesystem, target *kernel.Task, mask linux.SignalSet, flags uint32) (*vfs.FileDescription, error) {
 	vd := vfsObj.NewAnonVirtualDentry("[signalfd]")
-	defer vd.DecRef()
+	defer vd.DecRef(target)
 	sfd := &SignalFileDescription{
 		target: target,
-		mask:   mask,
 	}
+	sfd.entry.Init(sfd, waiter.EventMask(mask))
+	sfd.target.SignalRegister(&sfd.entry)
 	if err := sfd.vfsfd.Init(sfd, flags, vd.Mount(), vd.Dentry(), &vfs.FileDescriptionOptions{
 		UseDentryMetadata: true,
 		DenyPRead:         true,
 		DenyPWrite:        true,
 	}); err != nil {
+		sfd.target.SignalUnregister(&sfd.entry)
 		return nil, err
 	}
 	return &sfd.vfsfd, nil
@@ -73,64 +81,88 @@ func New(vfsObj *vfs.VirtualFilesystem, target *kernel.Task, mask linux.SignalSe
 func (sfd *SignalFileDescription) Mask() linux.SignalSet {
 	sfd.mu.Lock()
 	defer sfd.mu.Unlock()
-	return sfd.mask
+	return linux.SignalSet(sfd.entry.Mask())
 }
 
 // SetMask sets the signal mask.
 func (sfd *SignalFileDescription) SetMask(mask linux.SignalSet) {
 	sfd.mu.Lock()
 	defer sfd.mu.Unlock()
-	sfd.mask = mask
+	sfd.target.SignalUnregister(&sfd.entry)
+	sfd.entry.Init(sfd, waiter.EventMask(mask))
+	sfd.target.SignalRegister(&sfd.entry)
 }
 
-// Read implements FileDescriptionImpl.Read.
+// Read implements vfs.FileDescriptionImpl.Read.
 func (sfd *SignalFileDescription) Read(ctx context.Context, dst usermem.IOSequence, _ vfs.ReadOptions) (int64, error) {
 	// Attempt to dequeue relevant signals.
 	info, err := sfd.target.Sigtimedwait(sfd.Mask(), 0)
 	if err != nil {
 		// There must be no signal available.
-		return 0, syserror.ErrWouldBlock
+		return 0, linuxerr.ErrWouldBlock
 	}
 
 	// Copy out the signal info using the specified format.
-	var buf [128]byte
-	binary.Marshal(buf[:0], usermem.ByteOrder, &linux.SignalfdSiginfo{
+	infoNative := linux.SignalfdSiginfo{
 		Signo:   uint32(info.Signo),
 		Errno:   info.Errno,
 		Code:    info.Code,
-		PID:     uint32(info.Pid()),
-		UID:     uint32(info.Uid()),
+		PID:     uint32(info.PID()),
+		UID:     uint32(info.UID()),
 		Status:  info.Status(),
 		Overrun: uint32(info.Overrun()),
 		Addr:    info.Addr(),
-	})
-	n, err := dst.CopyOut(ctx, buf[:])
-	return int64(n), err
+	}
+	n, err := infoNative.WriteTo(dst.Writer(ctx))
+	if err == usermem.ErrEndOfIOSequence {
+		// Partial copy-out ok.
+		err = nil
+	}
+	return n, err
 }
 
 // Readiness implements waiter.Waitable.Readiness.
 func (sfd *SignalFileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
 	sfd.mu.Lock()
 	defer sfd.mu.Unlock()
-	if mask&waiter.EventIn != 0 && sfd.target.PendingSignals()&sfd.mask != 0 {
-		return waiter.EventIn // Pending signals.
+	if mask&waiter.ReadableEvents != 0 && sfd.target.PendingSignals()&linux.SignalSet(sfd.entry.Mask()) != 0 {
+		return waiter.ReadableEvents // Pending signals.
 	}
 	return 0
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (sfd *SignalFileDescription) EventRegister(entry *waiter.Entry, _ waiter.EventMask) {
-	sfd.mu.Lock()
-	defer sfd.mu.Unlock()
-	// Register for the signal set; ignore the passed events.
-	sfd.target.SignalRegister(entry, waiter.EventMask(sfd.mask))
+func (sfd *SignalFileDescription) EventRegister(e *waiter.Entry) error {
+	sfd.queue.EventRegister(e)
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
-func (sfd *SignalFileDescription) EventUnregister(entry *waiter.Entry) {
-	// Unregister the original entry.
-	sfd.target.SignalUnregister(entry)
+func (sfd *SignalFileDescription) EventUnregister(e *waiter.Entry) {
+	sfd.queue.EventUnregister(e)
 }
 
-// Release implements FileDescriptionImpl.Release()
-func (sfd *SignalFileDescription) Release() {}
+// NotifyEvent implements waiter.EventListener.NotifyEvent.
+func (sfd *SignalFileDescription) NotifyEvent(mask waiter.EventMask) {
+	sfd.queue.Notify(waiter.EventIn) // Always notify data available.
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (sfd *SignalFileDescription) Epollable() bool {
+	return true
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (sfd *SignalFileDescription) Release(context.Context) {
+	sfd.target.SignalUnregister(&sfd.entry)
+}
+
+// RegisterFileAsyncHandler implements vfs.FileDescriptionImpl.RegisterFileAsyncHandler.
+func (sfd *SignalFileDescription) RegisterFileAsyncHandler(fd *vfs.FileDescription) error {
+	return sfd.NoAsyncEventFD.RegisterFileAsyncHandler(fd)
+}
+
+// UnregisterFileAsyncHandler implements vfs.FileDescriptionImpl.UnregisterFileAsyncHandler.
+func (sfd *SignalFileDescription) UnregisterFileAsyncHandler(fd *vfs.FileDescription) {
+	sfd.NoAsyncEventFD.UnregisterFileAsyncHandler(fd)
+}

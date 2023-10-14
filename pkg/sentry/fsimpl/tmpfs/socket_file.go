@@ -16,19 +16,22 @@ package tmpfs
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 )
 
 // socketFile is a socket (=S_IFSOCK) tmpfs file.
+//
+// +stateify savable
 type socketFile struct {
 	inode inode
 	ep    transport.BoundEndpoint
 }
 
-func (fs *filesystem) newSocketFile(kuid auth.KUID, kgid auth.KGID, mode linux.FileMode, ep transport.BoundEndpoint) *inode {
+func (fs *filesystem) newSocketFile(kuid auth.KUID, kgid auth.KGID, mode linux.FileMode, ep transport.BoundEndpoint, parentDir *directory) *inode {
 	file := &socketFile{ep: ep}
-	file.inode.init(file, fs, kuid, kgid, mode)
-	file.inode.nlink = 1 // from parent directory
+	file.inode.init(file, fs, kuid, kgid, mode, parentDir)
+	file.inode.nlink = atomicbitops.FromUint32(1) // from parent directory
 	return &file.inode
 }

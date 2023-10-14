@@ -18,31 +18,28 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/binary"
+	"gvisor.dev/gvisor/pkg/bits"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/syserr"
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
-
-// TODO(gvisor.dev/issue/170): The following per-matcher params should be
-// supported:
-// - Table name
-// - Match size
-// - User size
-// - Hooks
-// - Proto
-// - Family
 
 // matchMaker knows how to (un)marshal the matcher named name().
 type matchMaker interface {
 	// name is the matcher name as stored in the xt_entry_match struct.
 	name() string
 
-	// marshal converts from an stack.Matcher to an ABI struct.
-	marshal(matcher stack.Matcher) []byte
+	// marshal converts from a stack.Matcher to an ABI struct.
+	marshal(matcher matcher) []byte
 
 	// unmarshal converts from the ABI matcher struct to an
 	// stack.Matcher.
-	unmarshal(buf []byte, filter stack.IPHeaderFilter) (stack.Matcher, error)
+	unmarshal(task *kernel.Task, buf []byte, filter stack.IPHeaderFilter) (stack.Matcher, error)
+}
+
+type matcher interface {
+	name() string
 }
 
 // matchMakers maps the name of supported matchers to the matchMaker that
@@ -58,8 +55,9 @@ func registerMatchMaker(mm matchMaker) {
 	matchMakers[mm.name()] = mm
 }
 
-func marshalMatcher(matcher stack.Matcher) []byte {
-	matchMaker, ok := matchMakers[matcher.Name()]
+func marshalMatcher(mr stack.Matcher) []byte {
+	matcher := mr.(matcher)
+	matchMaker, ok := matchMakers[matcher.name()]
 	if !ok {
 		panic(fmt.Sprintf("Unknown matcher of type %T.", matcher))
 	}
@@ -72,7 +70,7 @@ func marshalEntryMatch(name string, data []byte) []byte {
 	nflog("marshaling matcher %q", name)
 
 	// We have to pad this struct size to a multiple of 8 bytes.
-	size := binary.AlignUp(linux.SizeOfXTEntryMatch+len(data), 8)
+	size := bits.AlignUp(linux.SizeOfXTEntryMatch+len(data), 8)
 	matcher := linux.KernelXTEntryMatch{
 		XTEntryMatch: linux.XTEntryMatch{
 			MatchSize: uint16(size),
@@ -81,15 +79,105 @@ func marshalEntryMatch(name string, data []byte) []byte {
 	}
 	copy(matcher.Name[:], name)
 
-	buf := make([]byte, 0, size)
-	buf = binary.Marshal(buf, usermem.ByteOrder, matcher)
-	return append(buf, make([]byte, size-len(buf))...)
+	buf := make([]byte, size)
+	bufRemain := matcher.XTEntryMatch.MarshalUnsafe(buf)
+	copy(bufRemain, matcher.Data)
+	return buf
 }
 
-func unmarshalMatcher(match linux.XTEntryMatch, filter stack.IPHeaderFilter, buf []byte) (stack.Matcher, error) {
+func unmarshalMatcher(task *kernel.Task, match linux.XTEntryMatch, filter stack.IPHeaderFilter, buf []byte) (stack.Matcher, error) {
 	matchMaker, ok := matchMakers[match.Name.String()]
 	if !ok {
 		return nil, fmt.Errorf("unsupported matcher with name %q", match.Name.String())
 	}
-	return matchMaker.unmarshal(buf, filter)
+	return matchMaker.unmarshal(task, buf, filter)
+}
+
+// targetMaker knows how to (un)marshal a target. Once registered,
+// marshalTarget and unmarshalTarget can be used.
+type targetMaker interface {
+	// id uniquely identifies the target.
+	id() targetID
+
+	// marshal converts from a target to an ABI struct.
+	marshal(target target) []byte
+
+	// unmarshal converts from the ABI matcher struct to a target.
+	unmarshal(buf []byte, filter stack.IPHeaderFilter) (target, *syserr.Error)
+}
+
+// A targetID uniquely identifies a target.
+type targetID struct {
+	// name is the target name as stored in the xt_entry_target struct.
+	name string
+
+	// networkProtocol is the protocol to which the target applies.
+	networkProtocol tcpip.NetworkProtocolNumber
+
+	// revision is the version of the target.
+	revision uint8
+}
+
+// target extends a stack.Target, allowing it to be used with the extension
+// system. The sentry only uses targets, never stack.Targets directly.
+type target interface {
+	stack.Target
+	id() targetID
+}
+
+// targetMakers maps the targetID of supported targets to the targetMaker that
+// marshals and unmarshals it. It is immutable after package initialization.
+var targetMakers = map[targetID]targetMaker{}
+
+func targetRevision(name string, netProto tcpip.NetworkProtocolNumber, rev uint8) (uint8, bool) {
+	tid := targetID{
+		name:            name,
+		networkProtocol: netProto,
+		revision:        rev,
+	}
+	if _, ok := targetMakers[tid]; !ok {
+		return 0, false
+	}
+
+	// Return the highest supported revision unless rev is higher.
+	for _, other := range targetMakers {
+		otherID := other.id()
+		if name == otherID.name && netProto == otherID.networkProtocol && otherID.revision > rev {
+			rev = uint8(otherID.revision)
+		}
+	}
+	return rev, true
+}
+
+// registerTargetMaker should be called by target extensions to register them
+// with the netfilter package.
+func registerTargetMaker(tm targetMaker) {
+	if _, ok := targetMakers[tm.id()]; ok {
+		panic(fmt.Sprintf("multiple targets registered with name %q.", tm.id()))
+	}
+	targetMakers[tm.id()] = tm
+}
+
+func marshalTarget(tgt stack.Target) []byte {
+	// The sentry only uses targets, never stack.Targets directly.
+	target := tgt.(target)
+	targetMaker, ok := targetMakers[target.id()]
+	if !ok {
+		panic(fmt.Sprintf("unknown target of type %T with id %+v.", target, target.id()))
+	}
+	return targetMaker.marshal(target)
+}
+
+func unmarshalTarget(target linux.XTEntryTarget, filter stack.IPHeaderFilter, buf []byte) (target, *syserr.Error) {
+	tid := targetID{
+		name:            target.Name.String(),
+		networkProtocol: filter.NetworkProtocol(),
+		revision:        target.Revision,
+	}
+	targetMaker, ok := targetMakers[tid]
+	if !ok {
+		nflog("unsupported target with name %q", target.Name.String())
+		return nil, syserr.ErrInvalidArgument
+	}
+	return targetMaker.unmarshal(buf, filter)
 }

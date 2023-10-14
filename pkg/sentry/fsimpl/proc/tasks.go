@@ -21,11 +21,11 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 const (
@@ -37,11 +37,16 @@ const (
 //
 // +stateify savable
 type tasksInode struct {
-	kernfs.InodeNotSymlink
-	kernfs.InodeDirectoryNoNewChildren
+	implStatFS
+	kernfs.InodeAlwaysValid
 	kernfs.InodeAttrs
+	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotAnonymous
+	kernfs.InodeNotSymlink
+	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
-	kernfs.AlwaysValid
+	tasksInodeRefs
 
 	locks vfs.FileLocks
 
@@ -50,77 +55,87 @@ type tasksInode struct {
 
 	// '/proc/self' and '/proc/thread-self' have custom directory offsets in
 	// Linux. So handle them outside of OrderedChildren.
-	selfSymlink       *vfs.Dentry
-	threadSelfSymlink *vfs.Dentry
 
-	// cgroupControllers is a map of controller name to directory in the
+	// fakeCgroupControllers is a map of controller name to directory in the
 	// cgroup hierarchy. These controllers are immutable and will be listed
 	// in /proc/pid/cgroup if not nil.
-	cgroupControllers map[string]string
+	fakeCgroupControllers map[string]string
 }
 
 var _ kernfs.Inode = (*tasksInode)(nil)
 
-func (fs *filesystem) newTasksInode(k *kernel.Kernel, pidns *kernel.PIDNamespace, cgroupControllers map[string]string) (*tasksInode, *kernfs.Dentry) {
+func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns *kernel.PIDNamespace, fakeCgroupControllers map[string]string) *tasksInode {
 	root := auth.NewRootCredentials(pidns.UserNamespace())
-	contents := map[string]*kernfs.Dentry{
-		"cpuinfo":     fs.newDentry(root, fs.NextIno(), 0444, newStaticFileSetStat(cpuInfoData(k))),
-		"filesystems": fs.newDentry(root, fs.NextIno(), 0444, &filesystemsData{}),
-		"loadavg":     fs.newDentry(root, fs.NextIno(), 0444, &loadavgData{}),
-		"sys":         fs.newSysDir(root, k),
-		"meminfo":     fs.newDentry(root, fs.NextIno(), 0444, &meminfoData{}),
-		"mounts":      kernfs.NewStaticSymlink(root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/mounts"),
-		"net":         kernfs.NewStaticSymlink(root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/net"),
-		"stat":        fs.newDentry(root, fs.NextIno(), 0444, &statData{}),
-		"uptime":      fs.newDentry(root, fs.NextIno(), 0444, &uptimeData{}),
-		"version":     fs.newDentry(root, fs.NextIno(), 0444, &versionData{}),
+	contents := map[string]kernfs.Inode{
+		"cmdline":        fs.newInode(ctx, root, 0444, &cmdLineData{}),
+		"cpuinfo":        fs.newInode(ctx, root, 0444, newStaticFileSetStat(cpuInfoData(k))),
+		"filesystems":    fs.newInode(ctx, root, 0444, &filesystemsData{}),
+		"loadavg":        fs.newInode(ctx, root, 0444, &loadavgData{}),
+		"sys":            fs.newSysDir(ctx, root, k),
+		"bus":            fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
+		"fs":             fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
+		"irq":            fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
+		"meminfo":        fs.newInode(ctx, root, 0444, &meminfoData{}),
+		"mounts":         kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/mounts"),
+		"net":            kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/net"),
+		"sentry-meminfo": fs.newInode(ctx, root, 0444, &sentryMeminfoData{}),
+		"stat":           fs.newInode(ctx, root, 0444, &statData{}),
+		"sysrq-trigger":  fs.newInode(ctx, root, 0200, newStaticFile("")),
+		"uptime":         fs.newInode(ctx, root, 0444, &uptimeData{}),
+		"version":        fs.newInode(ctx, root, 0444, &versionData{}),
+	}
+	// If fakeCgroupControllers are provided, don't create a cgroupfs backed
+	// /proc/cgroup as it will not match the fake controllers.
+	if len(fakeCgroupControllers) == 0 {
+		contents["cgroups"] = fs.newInode(ctx, root, 0444, &cgroupsData{})
 	}
 
 	inode := &tasksInode{
-		pidns:             pidns,
-		fs:                fs,
-		selfSymlink:       fs.newSelfSymlink(root, fs.NextIno(), pidns).VFSDentry(),
-		threadSelfSymlink: fs.newThreadSelfSymlink(root, fs.NextIno(), pidns).VFSDentry(),
-		cgroupControllers: cgroupControllers,
+		pidns:                 pidns,
+		fs:                    fs,
+		fakeCgroupControllers: fakeCgroupControllers,
 	}
-	inode.InodeAttrs.Init(root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
-
-	dentry := &kernfs.Dentry{}
-	dentry.Init(inode)
+	inode.InodeAttrs.Init(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
+	inode.InitRefs()
 
 	inode.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
-	links := inode.OrderedChildren.Populate(dentry, contents)
+	links := inode.OrderedChildren.Populate(contents)
 	inode.IncLinks(links)
 
-	return inode, dentry
+	return inode
 }
 
-// Lookup implements kernfs.inodeDynamicLookup.
-func (i *tasksInode) Lookup(ctx context.Context, name string) (*vfs.Dentry, error) {
-	// Try to lookup a corresponding task.
+// Lookup implements kernfs.inodeDirectory.Lookup.
+func (i *tasksInode) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
+	// Check if a static entry was looked up.
+	if d, err := i.OrderedChildren.Lookup(ctx, name); err == nil {
+		return d, nil
+	}
+
+	// Not a static entry. Try to lookup a corresponding task.
 	tid, err := strconv.ParseUint(name, 10, 64)
 	if err != nil {
+		root := auth.NewRootCredentials(i.pidns.UserNamespace())
 		// If it failed to parse, check if it's one of the special handled files.
 		switch name {
 		case selfName:
-			return i.selfSymlink, nil
+			return i.newSelfSymlink(ctx, root), nil
 		case threadSelfName:
-			return i.threadSelfSymlink, nil
+			return i.newThreadSelfSymlink(ctx, root), nil
 		}
-		return nil, syserror.ENOENT
+		return nil, linuxerr.ENOENT
 	}
 
 	task := i.pidns.TaskWithID(kernel.ThreadID(tid))
 	if task == nil {
-		return nil, syserror.ENOENT
+		return nil, linuxerr.ENOENT
 	}
 
-	taskDentry := i.fs.newTaskInode(task, i.pidns, true, i.cgroupControllers)
-	return taskDentry.VFSDentry(), nil
+	return i.fs.newTaskInode(ctx, task, i.pidns, true, i.fakeCgroupControllers)
 }
 
-// IterDirents implements kernfs.inodeDynamicLookup.
-func (i *tasksInode) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback, offset, _ int64) (int64, error) {
+// IterDirents implements kernfs.inodeDirectory.IterDirents.
+func (i *tasksInode) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.IterDirentsCallback, offset, _ int64) (int64, error) {
 	// fs/proc/internal.h: #define FIRST_PROCESS_ENTRY 256
 	const FIRST_PROCESS_ENTRY = 256
 
@@ -197,17 +212,19 @@ func (i *tasksInode) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback
 	return maxTaskID, nil
 }
 
-// Open implements kernfs.Inode.
-func (i *tasksInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &i.OrderedChildren, &i.locks, &opts)
+// Open implements kernfs.Inode.Open.
+func (i *tasksInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), d, &i.OrderedChildren, &i.locks, &opts, kernfs.GenericDirectoryFDOptions{
+		SeekEnd: kernfs.SeekEndZero,
+	})
 	if err != nil {
 		return nil, err
 	}
 	return fd.VFSFileDescription(), nil
 }
 
-func (i *tasksInode) Stat(vsfs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
-	stat, err := i.InodeAttrs.Stat(vsfs, opts)
+func (i *tasksInode) Stat(ctx context.Context, vsfs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
+	stat, err := i.InodeAttrs.Stat(ctx, vsfs, opts)
 	if err != nil {
 		return linux.Statx{}, err
 	}
@@ -224,9 +241,16 @@ func (i *tasksInode) Stat(vsfs *vfs.Filesystem, opts vfs.StatOptions) (linux.Sta
 	return stat, nil
 }
 
+// DecRef implements kernfs.Inode.DecRef.
+func (i *tasksInode) DecRef(ctx context.Context) {
+	i.tasksInodeRefs.DecRef(func() { i.Destroy(ctx) })
+}
+
 // staticFileSetStat implements a special static file that allows inode
 // attributes to be set. This is to support /proc files that are readonly, but
 // allow attributes to be set.
+//
+// +stateify savable
 type staticFileSetStat struct {
 	dynamicBytesFileSetAttr
 	vfs.StaticData
@@ -240,10 +264,6 @@ func newStaticFileSetStat(data string) *staticFileSetStat {
 
 func cpuInfoData(k *kernel.Kernel) string {
 	features := k.FeatureSet()
-	if features == nil {
-		// Kernel is always initialized with a FeatureSet.
-		panic("cpuinfo read with nil FeatureSet")
-	}
 	var buf bytes.Buffer
 	for i, max := uint(0), k.ApplicationCores(); i < max; i++ {
 		features.WriteCPUInfoTo(i, &buf)
@@ -251,6 +271,6 @@ func cpuInfoData(k *kernel.Kernel) string {
 	return buf.String()
 }
 
-func shmData(v uint64) dynamicInode {
+func ipcData(v uint64) dynamicInode {
 	return newStaticFile(strconv.FormatUint(v, 10))
 }

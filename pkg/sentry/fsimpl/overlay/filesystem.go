@@ -15,22 +15,31 @@
 package overlay
 
 import (
-	"sync/atomic"
+	"fmt"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
+
+// _OVL_XATTR_PREFIX is an extended attribute key prefix to identify overlayfs
+// attributes.
+// Linux: fs/overlayfs/overlayfs.h:OVL_XATTR_PREFIX
+const _OVL_XATTR_PREFIX = linux.XATTR_TRUSTED_PREFIX + "overlay."
 
 // _OVL_XATTR_OPAQUE is an extended attribute key whose value is set to "y" for
 // opaque directories.
 // Linux: fs/overlayfs/overlayfs.h:OVL_XATTR_OPAQUE
-const _OVL_XATTR_OPAQUE = "trusted.overlay.opaque"
+const _OVL_XATTR_OPAQUE = _OVL_XATTR_PREFIX + "opaque"
 
 func isWhiteout(stat *linux.Statx) bool {
 	return stat.Mode&linux.S_IFMT == linux.S_IFCHR && stat.RdevMajor == 0 && stat.RdevMinor == 0
@@ -45,7 +54,7 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 }
 
 var dentrySlicePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		ds := make([]*dentry, 0, 4) // arbitrary non-zero initial capacity
 		return &ds
 	},
@@ -70,35 +79,48 @@ func putDentrySlice(ds *[]*dentry) {
 }
 
 // renameMuRUnlockAndCheckDrop calls fs.renameMu.RUnlock(), then calls
-// dentry.checkDropLocked on all dentries in *ds with fs.renameMu locked for
+// dentry.checkDropLocked on all dentries in *dsp with fs.renameMu locked for
 // writing.
 //
-// ds is a pointer-to-pointer since defer evaluates its arguments immediately,
+// dsp is a pointer-to-pointer since defer evaluates its arguments immediately,
 // but dentry slices are allocated lazily, and it's much easier to say "defer
 // fs.renameMuRUnlockAndCheckDrop(&ds)" than "defer func() {
 // fs.renameMuRUnlockAndCheckDrop(ds) }()" to work around this.
-func (fs *filesystem) renameMuRUnlockAndCheckDrop(ds **[]*dentry) {
+//
+// +checklocksreleaseread:fs.renameMu
+func (fs *filesystem) renameMuRUnlockAndCheckDrop(ctx context.Context, dsp **[]*dentry) {
 	fs.renameMu.RUnlock()
-	if *ds == nil {
+	if *dsp == nil {
 		return
 	}
-	if len(**ds) != 0 {
+	ds := **dsp
+	// Only go through calling dentry.checkDropLocked() (which requires
+	// re-locking renameMu) if we actually have any dentries with zero refs.
+	checkAny := false
+	for i := range ds {
+		if ds[i].refs.Load() == 0 {
+			checkAny = true
+			break
+		}
+	}
+	if checkAny {
 		fs.renameMu.Lock()
-		for _, d := range **ds {
-			d.checkDropLocked()
+		for _, d := range ds {
+			d.checkDropLocked(ctx)
 		}
 		fs.renameMu.Unlock()
 	}
-	putDentrySlice(*ds)
+	putDentrySlice(*dsp)
 }
 
-func (fs *filesystem) renameMuUnlockAndCheckDrop(ds **[]*dentry) {
+// +checklocksrelease:fs.renameMu
+func (fs *filesystem) renameMuUnlockAndCheckDrop(ctx context.Context, ds **[]*dentry) {
 	if *ds == nil {
 		fs.renameMu.Unlock()
 		return
 	}
 	for _, d := range **ds {
-		d.checkDropLocked()
+		d.checkDropLocked(ctx)
 	}
 	fs.renameMu.Unlock()
 	putDentrySlice(*ds)
@@ -110,63 +132,68 @@ func (fs *filesystem) renameMuUnlockAndCheckDrop(ds **[]*dentry) {
 // Dentries which may have a reference count of zero, and which therefore
 // should be dropped once traversal is complete, are appended to ds.
 //
-// Preconditions: fs.renameMu must be locked. d.dirMu must be locked.
-// !rp.Done().
-func (fs *filesystem) stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry, mayFollowSymlinks bool, ds **[]*dentry) (*dentry, error) {
+// Preconditions:
+//   - fs.renameMu must be locked.
+//   - d.dirMu must be locked.
+//   - !rp.Done().
+func (fs *filesystem) stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry, ds **[]*dentry) (*dentry, lookupLayer, bool, error) {
 	if !d.isDir() {
-		return nil, syserror.ENOTDIR
+		return nil, lookupLayerNone, false, linuxerr.ENOTDIR
 	}
 	if err := d.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
-		return nil, err
+		return nil, lookupLayerNone, false, err
 	}
-afterSymlink:
 	name := rp.Component()
 	if name == "." {
 		rp.Advance()
-		return d, nil
+		return d, d.topLookupLayer(), false, nil
 	}
 	if name == ".." {
-		if isRoot, err := rp.CheckRoot(&d.vfsd); err != nil {
-			return nil, err
-		} else if isRoot || d.parent == nil {
+		if isRoot, err := rp.CheckRoot(ctx, &d.vfsd); err != nil {
+			return nil, lookupLayerNone, false, err
+		} else if isRoot || d.parent.Load() == nil {
 			rp.Advance()
-			return d, nil
+			return d, d.topLookupLayer(), false, nil
 		}
-		if err := rp.CheckMount(&d.parent.vfsd); err != nil {
-			return nil, err
+		if err := rp.CheckMount(ctx, &d.parent.Load().vfsd); err != nil {
+			return nil, lookupLayerNone, false, err
 		}
 		rp.Advance()
-		return d.parent, nil
+		parent := d.parent.Load()
+		return parent, parent.topLookupLayer(), false, nil
 	}
-	child, err := fs.getChildLocked(ctx, d, name, ds)
+	if uint64(len(name)) > fs.maxFilenameLen {
+		return nil, lookupLayerNone, false, linuxerr.ENAMETOOLONG
+	}
+	child, topLookupLayer, err := fs.getChildLocked(ctx, d, name, ds)
 	if err != nil {
-		return nil, err
+		return nil, topLookupLayer, false, err
 	}
-	if err := rp.CheckMount(&child.vfsd); err != nil {
-		return nil, err
+	if err := rp.CheckMount(ctx, &child.vfsd); err != nil {
+		return nil, lookupLayerNone, false, err
 	}
-	if child.isSymlink() && mayFollowSymlinks && rp.ShouldFollowSymlink() {
+	if child.isSymlink() && rp.ShouldFollowSymlink() {
 		target, err := child.readlink(ctx)
 		if err != nil {
-			return nil, err
+			return nil, lookupLayerNone, false, err
 		}
-		if err := rp.HandleSymlink(target); err != nil {
-			return nil, err
-		}
-		goto afterSymlink // don't check the current directory again
+		followedSymlink, err := rp.HandleSymlink(target)
+		return d, topLookupLayer, followedSymlink, err
 	}
 	rp.Advance()
-	return child, nil
+	return child, topLookupLayer, false, nil
 }
 
-// Preconditions: fs.renameMu must be locked. d.dirMu must be locked.
-func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
+// Preconditions:
+//   - fs.renameMu must be locked.
+//   - d.dirMu must be locked.
+func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name string, ds **[]*dentry) (*dentry, lookupLayer, error) {
 	if child, ok := parent.children[name]; ok {
-		return child, nil
+		return child, child.topLookupLayer(), nil
 	}
-	child, err := fs.lookupLocked(ctx, parent, name)
+	child, topLookupLayer, err := fs.lookupLocked(ctx, parent, name)
 	if err != nil {
-		return nil, err
+		return nil, topLookupLayer, err
 	}
 	if parent.children == nil {
 		parent.children = make(map[string]*dentry)
@@ -174,14 +201,16 @@ func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name s
 	parent.children[name] = child
 	// child's refcount is initially 0, so it may be dropped after traversal.
 	*ds = appendDentry(*ds, child)
-	return child, nil
+	return child, topLookupLayer, nil
 }
 
-// Preconditions: fs.renameMu must be locked. parent.dirMu must be locked.
-func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name string) (*dentry, error) {
+// Preconditions:
+//   - fs.renameMu must be locked.
+//   - parent.dirMu must be locked.
+func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name string) (*dentry, lookupLayer, error) {
 	childPath := fspath.Parse(name)
 	child := fs.newDentry()
-	existsOnAnyLayer := false
+	topLookupLayer := lookupLayerNone
 	var lookupErr error
 
 	vfsObj := fs.vfsfs.VirtualFilesystem()
@@ -191,7 +220,7 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			Start: parentVD,
 			Path:  childPath,
 		}, &vfs.GetDentryOptions{})
-		if err == syserror.ENOENT || err == syserror.ENAMETOOLONG {
+		if linuxerr.Equals(linuxerr.ENOENT, err) || linuxerr.Equals(linuxerr.ENAMETOOLONG, err) {
 			// The file doesn't exist on this layer. Proceed to the next one.
 			return true
 		}
@@ -199,9 +228,10 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			lookupErr = err
 			return false
 		}
+		defer childVD.DecRef(ctx)
 
 		mask := uint32(linux.STATX_TYPE)
-		if !existsOnAnyLayer {
+		if topLookupLayer == lookupLayerNone {
 			// Mode, UID, GID, and (for non-directories) inode number come from
 			// the topmost layer on which the file exists.
 			mask |= linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID | linux.STATX_INO
@@ -217,17 +247,20 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			return false
 		}
 		if stat.Mask&mask != mask {
-			lookupErr = syserror.EREMOTE
+			lookupErr = linuxerr.EREMOTE
 			return false
 		}
 
 		if isWhiteout(&stat) {
 			// This is a whiteout, so it "doesn't exist" on this layer, and
 			// layers below this one are ignored.
+			if isUpper {
+				topLookupLayer = lookupLayerUpperWhiteout
+			}
 			return false
 		}
 		isDir := stat.Mode&linux.S_IFMT == linux.S_IFDIR
-		if existsOnAnyLayer && !isDir {
+		if topLookupLayer != lookupLayerNone && !isDir {
 			// Directories are not merged with non-directory files from lower
 			// layers; instead, layers including and below the first
 			// non-directory file are ignored. (This file must be a directory
@@ -237,20 +270,25 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 		}
 
 		// Update child to include this layer.
+		childVD.IncRef()
 		if isUpper {
 			child.upperVD = childVD
-			child.copiedUp = 1
+			child.copiedUp = atomicbitops.FromUint32(1)
 		} else {
 			child.lowerVDs = append(child.lowerVDs, childVD)
 		}
-		if !existsOnAnyLayer {
-			existsOnAnyLayer = true
-			child.mode = uint32(stat.Mode)
-			child.uid = stat.UID
-			child.gid = stat.GID
-			child.devMajor = stat.DevMajor
-			child.devMinor = stat.DevMinor
-			child.ino = stat.Ino
+		if topLookupLayer == lookupLayerNone {
+			if isUpper {
+				topLookupLayer = lookupLayerUpper
+			} else {
+				topLookupLayer = lookupLayerLower
+			}
+			child.mode = atomicbitops.FromUint32(uint32(stat.Mode))
+			child.uid = atomicbitops.FromUint32(stat.UID)
+			child.gid = atomicbitops.FromUint32(stat.GID)
+			child.devMajor = atomicbitops.FromUint32(stat.DevMajor)
+			child.devMinor = atomicbitops.FromUint32(stat.DevMinor)
+			child.ino = atomicbitops.FromUint64(stat.Ino)
 		}
 
 		// For non-directory files, only the topmost layer that contains a file
@@ -259,12 +297,19 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 			return false
 		}
 
+		// Directories use the lowest layer inode and device numbers to generate a
+		// filesystem local inode number. This way the inode number does not change
+		// after copy ups.
+		child.devMajor = atomicbitops.FromUint32(stat.DevMajor)
+		child.devMinor = atomicbitops.FromUint32(stat.DevMinor)
+		child.ino = atomicbitops.FromUint64(stat.Ino)
+
 		// Directories are merged with directories from lower layers if they
 		// are not explicitly opaque.
-		opaqueVal, err := vfsObj.GetxattrAt(ctx, fs.creds, &vfs.PathOperation{
+		opaqueVal, err := vfsObj.GetXattrAt(ctx, fs.creds, &vfs.PathOperation{
 			Root:  childVD,
 			Start: childVD,
-		}, &vfs.GetxattrOptions{
+		}, &vfs.GetXattrOptions{
 			Name: _OVL_XATTR_OPAQUE,
 			Size: 1,
 		})
@@ -272,35 +317,45 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 	})
 
 	if lookupErr != nil {
-		child.destroyLocked()
-		return nil, lookupErr
+		child.destroyLocked(ctx)
+		return nil, topLookupLayer, lookupErr
 	}
-	if !existsOnAnyLayer {
-		child.destroyLocked()
-		return nil, syserror.ENOENT
+	if !topLookupLayer.existsInOverlay() {
+		child.destroyLocked(ctx)
+		return nil, topLookupLayer, linuxerr.ENOENT
 	}
 
-	// Device and inode numbers were copied from the topmost layer above;
-	// override them if necessary.
+	// Device and inode numbers were copied from the topmost layer above for
+	// non-directories. They were copied from the bottommost layer for
+	// directories. Override them if necessary. We can use RacyLoad() because
+	// child is still being initialized.
 	if child.isDir() {
-		child.devMajor = linux.UNNAMED_MAJOR
-		child.devMinor = fs.dirDevMinor
-		child.ino = fs.newDirIno()
+		child.ino.Store(fs.newDirIno(child.devMajor.RacyLoad(), child.devMinor.RacyLoad(), child.ino.RacyLoad()))
+		child.devMajor = atomicbitops.FromUint32(linux.UNNAMED_MAJOR)
+		child.devMinor = atomicbitops.FromUint32(fs.dirDevMinor)
 	} else if !child.upperVD.Ok() {
-		child.devMajor = linux.UNNAMED_MAJOR
-		child.devMinor = fs.lowerDevMinors[child.lowerVDs[0].Mount().Filesystem()]
+		childDevMinor, err := fs.getLowerDevMinor(child.devMajor.RacyLoad(), child.devMinor.RacyLoad())
+		if err != nil {
+			ctx.Infof("overlay.filesystem.lookupLocked: failed to map lower layer device number (%d, %d) to an overlay-specific device number: %v", child.devMajor.RacyLoad(), child.devMinor.RacyLoad(), err)
+			child.destroyLocked(ctx)
+			return nil, topLookupLayer, err
+		}
+		child.devMajor = atomicbitops.FromUint32(linux.UNNAMED_MAJOR)
+		child.devMinor = atomicbitops.FromUint32(childDevMinor)
 	}
 
 	parent.IncRef()
-	child.parent = parent
+	child.parent.Store(parent)
 	child.name = name
-	return child, nil
+	return child, topLookupLayer, nil
 }
 
 // lookupLayerLocked is similar to lookupLocked, but only returns information
 // about the file rather than a dentry.
 //
-// Preconditions: fs.renameMu must be locked. parent.dirMu must be locked.
+// Preconditions:
+//   - fs.renameMu must be locked.
+//   - parent.dirMu must be locked.
 func (fs *filesystem) lookupLayerLocked(ctx context.Context, parent *dentry, name string) (lookupLayer, error) {
 	childPath := fspath.Parse(name)
 	lookupLayer := lookupLayerNone
@@ -314,7 +369,7 @@ func (fs *filesystem) lookupLayerLocked(ctx context.Context, parent *dentry, nam
 		}, &vfs.StatOptions{
 			Mask: linux.STATX_TYPE,
 		})
-		if err == syserror.ENOENT || err == syserror.ENAMETOOLONG {
+		if linuxerr.Equals(linuxerr.ENOENT, err) || linuxerr.Equals(linuxerr.ENAMETOOLONG, err) {
 			// The file doesn't exist on this layer. Proceed to the next
 			// one.
 			return true
@@ -327,7 +382,7 @@ func (fs *filesystem) lookupLayerLocked(ctx context.Context, parent *dentry, nam
 			// Linux's overlayfs tends to return EREMOTE in cases where a file
 			// is unusable for reasons that are not better captured by another
 			// errno.
-			lookupErr = syserror.EREMOTE
+			lookupErr = linuxerr.EREMOTE
 			return false
 		}
 		if isWhiteout(&stat) {
@@ -385,11 +440,13 @@ func (ll lookupLayer) existsInOverlay() bool {
 // rp.Start().Impl().(*dentry)). It does not check that the returned directory
 // is searchable by the provider of rp.
 //
-// Preconditions: fs.renameMu must be locked. !rp.Done().
+// Preconditions:
+//   - fs.renameMu must be locked.
+//   - !rp.Done().
 func (fs *filesystem) walkParentDirLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry, ds **[]*dentry) (*dentry, error) {
 	for !rp.Final() {
 		d.dirMu.Lock()
-		next, err := fs.stepLocked(ctx, rp, d, true /* mayFollowSymlinks */, ds)
+		next, _, _, err := fs.stepLocked(ctx, rp, d, ds)
 		d.dirMu.Unlock()
 		if err != nil {
 			return nil, err
@@ -397,7 +454,7 @@ func (fs *filesystem) walkParentDirLocked(ctx context.Context, rp *vfs.Resolving
 		d = next
 	}
 	if !d.isDir() {
-		return nil, syserror.ENOTDIR
+		return nil, linuxerr.ENOTDIR
 	}
 	return d, nil
 }
@@ -409,7 +466,7 @@ func (fs *filesystem) resolveLocked(ctx context.Context, rp *vfs.ResolvingPath, 
 	d := rp.Start().Impl().(*dentry)
 	for !rp.Done() {
 		d.dirMu.Lock()
-		next, err := fs.stepLocked(ctx, rp, d, true /* mayFollowSymlinks */, ds)
+		next, _, _, err := fs.stepLocked(ctx, rp, d, ds)
 		d.dirMu.Unlock()
 		if err != nil {
 			return nil, err
@@ -417,61 +474,79 @@ func (fs *filesystem) resolveLocked(ctx context.Context, rp *vfs.ResolvingPath, 
 		d = next
 	}
 	if rp.MustBeDir() && !d.isDir() {
-		return nil, syserror.ENOTDIR
+		return nil, linuxerr.ENOTDIR
 	}
 	return d, nil
 }
 
+type createType int
+
+const (
+	createNonDirectory createType = iota
+	createDirectory
+	createSyntheticMountpoint
+)
+
 // doCreateAt checks that creating a file at rp is permitted, then invokes
 // create to do so.
 //
-// Preconditions: !rp.Done(). For the final path component in rp,
-// !rp.ShouldFollowSymlink().
-func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir bool, create func(parent *dentry, name string, haveUpperWhiteout bool) error) error {
+// Preconditions:
+//   - !rp.Done().
+//   - For the final path component in rp, !rp.ShouldFollowSymlink().
+func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct createType, create func(parent *dentry, name string, haveUpperWhiteout bool) error) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	start := rp.Start().Impl().(*dentry)
 	parent, err := fs.walkParentDirLocked(ctx, rp, start, &ds)
 	if err != nil {
 		return err
 	}
-	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
-		return err
-	}
 	name := rp.Component()
 	if name == "." || name == ".." {
-		return syserror.EEXIST
+		return linuxerr.EEXIST
 	}
-	if !dir && rp.MustBeDir() {
-		return syserror.ENOENT
+	if uint64(len(name)) > fs.maxFilenameLen {
+		return linuxerr.ENAMETOOLONG
 	}
 	if parent.vfsd.IsDead() {
-		return syserror.ENOENT
+		return linuxerr.ENOENT
 	}
-	mnt := rp.Mount()
-	if err := mnt.CheckBeginWrite(); err != nil {
+
+	if err := parent.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return err
 	}
-	defer mnt.EndWrite()
+
 	parent.dirMu.Lock()
 	defer parent.dirMu.Unlock()
 
 	// Determine if a file already exists at name.
 	if _, ok := parent.children[name]; ok {
-		return syserror.EEXIST
+		return linuxerr.EEXIST
 	}
 	childLayer, err := fs.lookupLayerLocked(ctx, parent, name)
 	if err != nil {
 		return err
 	}
 	if childLayer.existsInOverlay() {
-		return syserror.EEXIST
+		return linuxerr.EEXIST
 	}
 
+	if ct == createNonDirectory && rp.MustBeDir() {
+		return linuxerr.ENOENT
+	}
+
+	mnt := rp.Mount()
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return err
+	}
+	defer mnt.EndWrite()
+	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+		return err
+	}
 	// Ensure that the parent directory is copied-up so that we can create the
 	// new file in the upper layer.
-	if err := parent.copyUpLocked(ctx); err != nil {
+	if err := parent.copyUpMaybeSyntheticMountpointLocked(ctx, ct == createSyntheticMountpoint); err != nil {
 		return err
 	}
 
@@ -479,21 +554,30 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if err := create(parent, name, childLayer == lookupLayerUpperWhiteout); err != nil {
 		return err
 	}
+
 	parent.dirents = nil
+	ev := linux.IN_CREATE
+	if ct != createNonDirectory {
+		ev |= linux.IN_ISDIR
+	}
+	parent.watches.Notify(ctx, name, uint32(ev), 0 /* cookie */, vfs.InodeEvent, false /* unlinked */)
 	return nil
 }
 
+// CreateWhiteout creates a whiteout at pop. Whiteouts are created with
+// character devices with device ID = 0.
+//
 // Preconditions: pop's parent directory has been copied up.
-func (fs *filesystem) createWhiteout(ctx context.Context, vfsObj *vfs.VirtualFilesystem, pop *vfs.PathOperation) error {
-	return vfsObj.MknodAt(ctx, fs.creds, pop, &vfs.MknodOptions{
+func CreateWhiteout(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, pop *vfs.PathOperation) error {
+	return vfsObj.MknodAt(ctx, creds, pop, &vfs.MknodOptions{
 		Mode: linux.S_IFCHR, // permissions == include/linux/fs.h:WHITEOUT_MODE == 0
 		// DevMajor == DevMinor == 0, from include/linux/fs.h:WHITEOUT_DEV
 	})
 }
 
 func (fs *filesystem) cleanupRecreateWhiteout(ctx context.Context, vfsObj *vfs.VirtualFilesystem, pop *vfs.PathOperation) {
-	if err := fs.createWhiteout(ctx, vfsObj, pop); err != nil {
-		ctx.Warningf("Unrecoverable overlayfs inconsistency: failed to recreate whiteout after failed file creation: %v", err)
+	if err := CreateWhiteout(ctx, vfsObj, fs.creds, pop); err != nil {
+		panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to recreate whiteout after failed file creation: %v", err))
 	}
 }
 
@@ -501,19 +585,34 @@ func (fs *filesystem) cleanupRecreateWhiteout(ctx context.Context, vfsObj *vfs.V
 func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds *auth.Credentials, ats vfs.AccessTypes) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		return err
 	}
-	return d.checkPermissions(creds, ats)
+	if err := d.checkPermissions(creds, ats); err != nil {
+		return err
+	}
+	if !ats.MayWrite() {
+		// Not requesting write permission.  Allow it.
+		return nil
+	}
+	if rp.Mount().ReadOnly() {
+		return linuxerr.EROFS
+	}
+	if !d.upperVD.Ok() && !d.canBeCopiedUp() {
+		// A lower layer file that can not be copied up, can not be written to.
+		// Error out here. Don't give the application false hopes.
+		return linuxerr.EACCES
+	}
+	return nil
 }
 
 // BoundEndpointAt implements vfs.FilesystemImpl.BoundEndpointAt.
 func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.BoundEndpointOptions) (transport.BoundEndpoint, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		return nil, err
@@ -532,14 +631,14 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 func (fs *filesystem) GetDentryAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetDentryOptions) (*vfs.Dentry, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		return nil, err
 	}
 	if opts.CheckSearchable {
 		if !d.isDir() {
-			return nil, syserror.ENOTDIR
+			return nil, linuxerr.ENOTDIR
 		}
 		if err := d.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 			return nil, err
@@ -553,7 +652,7 @@ func (fs *filesystem) GetDentryAt(ctx context.Context, rp *vfs.ResolvingPath, op
 func (fs *filesystem) GetParentDentryAt(ctx context.Context, rp *vfs.ResolvingPath) (*vfs.Dentry, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	start := rp.Start().Impl().(*dentry)
 	d, err := fs.walkParentDirLocked(ctx, rp, start, &ds)
 	if err != nil {
@@ -565,13 +664,13 @@ func (fs *filesystem) GetParentDentryAt(ctx context.Context, rp *vfs.ResolvingPa
 
 // LinkAt implements vfs.FilesystemImpl.LinkAt.
 func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.VirtualDentry) error {
-	return fs.doCreateAt(ctx, rp, false /* dir */, func(parent *dentry, childName string, haveUpperWhiteout bool) error {
+	return fs.doCreateAt(ctx, rp, createNonDirectory, func(parent *dentry, childName string, haveUpperWhiteout bool) error {
 		if rp.Mount() != vd.Mount() {
-			return syserror.EXDEV
+			return linuxerr.EXDEV
 		}
 		old := vd.Dentry().Impl().(*dentry)
 		if old.isDir() {
-			return syserror.EPERM
+			return linuxerr.EPERM
 		}
 		if err := old.copyUpLocked(ctx); err != nil {
 			return err
@@ -605,19 +704,24 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 			},
 		}); err != nil {
 			if cleanupErr := vfsObj.UnlinkAt(ctx, fs.creds, &newpop); cleanupErr != nil {
-				ctx.Warningf("Unrecoverable overlayfs inconsistency: failed to delete upper layer file after LinkAt metadata update failure: %v", cleanupErr)
+				panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to delete upper layer file after LinkAt metadata update failure: %v", cleanupErr))
 			} else if haveUpperWhiteout {
 				fs.cleanupRecreateWhiteout(ctx, vfsObj, &newpop)
 			}
 			return err
 		}
+		old.watches.Notify(ctx, "", linux.IN_ATTRIB, 0 /* cookie */, vfs.InodeEvent, false /* unlinked */)
 		return nil
 	})
 }
 
 // MkdirAt implements vfs.FilesystemImpl.MkdirAt.
 func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MkdirOptions) error {
-	return fs.doCreateAt(ctx, rp, true /* dir */, func(parent *dentry, childName string, haveUpperWhiteout bool) error {
+	ct := createDirectory
+	if opts.ForSyntheticMountpoint {
+		ct = createSyntheticMountpoint
+	}
+	return fs.doCreateAt(ctx, rp, ct, func(parent *dentry, childName string, haveUpperWhiteout bool) error {
 		vfsObj := fs.vfsfs.VirtualFilesystem()
 		pop := vfs.PathOperation{
 			Root:  parent.upperVD,
@@ -635,36 +739,44 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 			}
 			return err
 		}
-		creds := rp.Credentials()
+
 		if err := vfsObj.SetStatAt(ctx, fs.creds, &pop, &vfs.SetStatOptions{
-			Stat: linux.Statx{
-				Mask: linux.STATX_UID | linux.STATX_GID,
-				UID:  uint32(creds.EffectiveKUID),
-				GID:  uint32(creds.EffectiveKGID),
-			},
+			Stat: parent.newChildOwnerStat(opts.Mode, rp.Credentials()),
 		}); err != nil {
 			if cleanupErr := vfsObj.RmdirAt(ctx, fs.creds, &pop); cleanupErr != nil {
-				ctx.Warningf("Unrecoverable overlayfs inconsistency: failed to delete upper layer directory after MkdirAt metadata update failure: %v", cleanupErr)
+				panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to delete upper layer directory after MkdirAt metadata update failure: %v", cleanupErr))
 			} else if haveUpperWhiteout {
 				fs.cleanupRecreateWhiteout(ctx, vfsObj, &pop)
 			}
 			return err
 		}
 		if haveUpperWhiteout {
-			// There may be directories on lower layers (previously hidden by
-			// the whiteout) that the new directory should not be merged with.
-			// Mark it opaque to prevent merging.
-			if err := vfsObj.SetxattrAt(ctx, fs.creds, &pop, &vfs.SetxattrOptions{
+			// A whiteout is being replaced with this new directory. There may be
+			// directories on lower layers (previously hidden by the whiteout) that
+			// the new directory should not be merged with, so mark as opaque.
+			// See fs/overlayfs/dir.c:ovl_create_over_whiteout() -> ovl_set_opaque().
+			if err := vfsObj.SetXattrAt(ctx, fs.creds, &pop, &vfs.SetXattrOptions{
 				Name:  _OVL_XATTR_OPAQUE,
 				Value: "y",
 			}); err != nil {
 				if cleanupErr := vfsObj.RmdirAt(ctx, fs.creds, &pop); cleanupErr != nil {
-					ctx.Warningf("Unrecoverable overlayfs inconsistency: failed to delete upper layer directory after MkdirAt set-opaque failure: %v", cleanupErr)
+					panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to delete upper layer directory after MkdirAt set-opaque failure: %v", cleanupErr))
 				} else {
 					fs.cleanupRecreateWhiteout(ctx, vfsObj, &pop)
 				}
 				return err
 			}
+		} else if len(parent.lowerVDs) > 0 {
+			// If haveUpperWhiteout is false and the parent is merged, then we should
+			// apply an optimization. We know that nothing exists on the parent's
+			// lower layers. Otherwise doCreateAt() would have failed with EEXIST.
+			// Mark the new directory opaque to avoid unnecessary lower lookups in
+			// fs.lookupLocked(). Allow it to fail since this is an optimization.
+			// See fs/overlayfs/dir.c:ovl_create_upper() -> ovl_set_opaque().
+			_ = vfsObj.SetXattrAt(ctx, fs.creds, &pop, &vfs.SetXattrOptions{
+				Name:  _OVL_XATTR_OPAQUE,
+				Value: "y",
+			})
 		}
 		return nil
 	})
@@ -672,10 +784,10 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 
 // MknodAt implements vfs.FilesystemImpl.MknodAt.
 func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MknodOptions) error {
-	return fs.doCreateAt(ctx, rp, false /* dir */, func(parent *dentry, childName string, haveUpperWhiteout bool) error {
+	return fs.doCreateAt(ctx, rp, createNonDirectory, func(parent *dentry, childName string, haveUpperWhiteout bool) error {
 		// Disallow attempts to create whiteouts.
 		if opts.Mode&linux.S_IFMT == linux.S_IFCHR && opts.DevMajor == 0 && opts.DevMinor == 0 {
-			return syserror.EPERM
+			return linuxerr.EPERM
 		}
 		vfsObj := fs.vfsfs.VirtualFilesystem()
 		pop := vfs.PathOperation{
@@ -696,14 +808,10 @@ func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		}
 		creds := rp.Credentials()
 		if err := vfsObj.SetStatAt(ctx, fs.creds, &pop, &vfs.SetStatOptions{
-			Stat: linux.Statx{
-				Mask: linux.STATX_UID | linux.STATX_GID,
-				UID:  uint32(creds.EffectiveKUID),
-				GID:  uint32(creds.EffectiveKGID),
-			},
+			Stat: parent.newChildOwnerStat(opts.Mode, creds),
 		}); err != nil {
 			if cleanupErr := vfsObj.UnlinkAt(ctx, fs.creds, &pop); cleanupErr != nil {
-				ctx.Warningf("Unrecoverable overlayfs inconsistency: failed to delete upper layer file after MknodAt metadata update failure: %v", cleanupErr)
+				panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to delete upper layer file after MknodAt metadata update failure: %v", cleanupErr))
 			} else if haveUpperWhiteout {
 				fs.cleanupRecreateWhiteout(ctx, vfsObj, &pop)
 			}
@@ -720,14 +828,30 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
+	unlocked := false
+	unlock := func() {
+		if !unlocked {
+			fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
+			unlocked = true
+		}
+	}
+	defer unlock()
 
 	start := rp.Start().Impl().(*dentry)
 	if rp.Done() {
-		if mustCreate {
-			return nil, syserror.EEXIST
+		if mayCreate && rp.MustBeDir() {
+			return nil, linuxerr.EISDIR
 		}
-		return start.openLocked(ctx, rp, &opts)
+		if mustCreate {
+			return nil, linuxerr.EEXIST
+		}
+		if err := start.ensureOpenableLocked(ctx, rp, &opts); err != nil {
+			return nil, err
+		}
+		start.IncRef()
+		defer start.DecRef(ctx)
+		unlock()
+		return start.openCopiedUp(ctx, rp, &opts)
 	}
 
 afterTrailingSymlink:
@@ -739,65 +863,91 @@ afterTrailingSymlink:
 	if err := parent.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return nil, err
 	}
+	// Reject attempts to open directories with O_CREAT.
+	if mayCreate && rp.MustBeDir() {
+		return nil, linuxerr.EISDIR
+	}
 	// Determine whether or not we need to create a file.
 	parent.dirMu.Lock()
-	child, err := fs.stepLocked(ctx, rp, parent, false /* mayFollowSymlinks */, &ds)
-	if err == syserror.ENOENT && mayCreate {
-		fd, err := fs.createAndOpenLocked(ctx, rp, parent, &opts, &ds)
+	child, topLookupLayer, followedSymlink, err := fs.stepLocked(ctx, rp, parent, &ds)
+	if followedSymlink {
 		parent.dirMu.Unlock()
-		return fd, err
-	}
-	if err != nil {
-		parent.dirMu.Unlock()
-		return nil, err
-	}
-	// Open existing child or follow symlink.
-	parent.dirMu.Unlock()
-	if mustCreate {
-		return nil, syserror.EEXIST
-	}
-	if child.isSymlink() && rp.ShouldFollowSymlink() {
-		target, err := child.readlink(ctx)
-		if err != nil {
-			return nil, err
+		if mustCreate {
+			// EEXIST must be returned if an existing symlink is opened with O_EXCL.
+			return nil, linuxerr.EEXIST
 		}
-		if err := rp.HandleSymlink(target); err != nil {
+		if err != nil {
+			// If followedSymlink && err != nil, then this symlink resolution error
+			// must be handled by the VFS layer.
 			return nil, err
 		}
 		start = parent
 		goto afterTrailingSymlink
 	}
-	return child.openLocked(ctx, rp, &opts)
-}
-
-// Preconditions: fs.renameMu must be locked.
-func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
-	ats := vfs.AccessTypesForOpenFlags(opts)
-	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
+	if linuxerr.Equals(linuxerr.ENOENT, err) && mayCreate {
+		fd, err := fs.createAndOpenLocked(ctx, rp, parent, &opts, &ds, topLookupLayer == lookupLayerUpperWhiteout)
+		parent.dirMu.Unlock()
+		return fd, err
+	}
+	parent.dirMu.Unlock()
+	if err != nil {
 		return nil, err
 	}
-	if ats.MayWrite() {
-		if err := d.copyUpLocked(ctx); err != nil {
-			return nil, err
-		}
+	if mustCreate {
+		return nil, linuxerr.EEXIST
 	}
+	if rp.MustBeDir() && !child.isDir() {
+		return nil, linuxerr.ENOTDIR
+	}
+	if err := child.ensureOpenableLocked(ctx, rp, &opts); err != nil {
+		return nil, err
+	}
+	child.IncRef()
+	defer child.DecRef(ctx)
+	unlock()
+	return child.openCopiedUp(ctx, rp, &opts)
+}
+
+// Preconditions: filesystem.renameMu must be locked.
+func (d *dentry) ensureOpenableLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) error {
+	ats := vfs.AccessTypesForOpenFlags(opts)
+	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
+		return err
+	}
+	if d.isDir() {
+		if ats.MayWrite() {
+			return linuxerr.EISDIR
+		}
+		if opts.Flags&linux.O_CREAT != 0 {
+			return linuxerr.EISDIR
+		}
+		if opts.Flags&linux.O_DIRECT != 0 {
+			return linuxerr.EINVAL
+		}
+		return nil
+	}
+
+	if !ats.MayWrite() {
+		return nil
+	}
+
+	// Copy up!
+	if err := rp.Mount().CheckBeginWrite(); err != nil {
+		return err
+	}
+	defer rp.Mount().EndWrite()
+	return d.copyUpLocked(ctx)
+}
+
+// Preconditions: If vfs.AccessTypesForOpenFlags(opts).MayWrite(), then d has
+// been copied up.
+func (d *dentry) openCopiedUp(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	mnt := rp.Mount()
 
 	// Directory FDs open FDs from each layer when directory entries are read,
 	// so they don't require opening an FD from d.topLayer() up front.
-	ftype := atomic.LoadUint32(&d.mode) & linux.S_IFMT
+	ftype := d.mode.Load() & linux.S_IFMT
 	if ftype == linux.S_IFDIR {
-		// Can't open directories with O_CREAT.
-		if opts.Flags&linux.O_CREAT != 0 {
-			return nil, syserror.EISDIR
-		}
-		// Can't open directories writably.
-		if ats&vfs.MayWrite != 0 {
-			return nil, syserror.EISDIR
-		}
-		if opts.Flags&linux.O_DIRECT != 0 {
-			return nil, syserror.EINVAL
-		}
 		fd := &directoryFD{}
 		fd.LockFD.Init(&d.locks)
 		if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &d.vfsd, &vfs.FileDescriptionOptions{
@@ -816,8 +966,11 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 	if err != nil {
 		return nil, err
 	}
+	if ftype != linux.S_IFREG {
+		return layerFD, nil
+	}
 	layerFlags := layerFD.StatusFlags()
-	fd := &nonDirectoryFD{
+	fd := &regularFileFD{
 		copiedUp:    isUpper,
 		cachedFD:    layerFD,
 		cachedFlags: layerFlags,
@@ -825,21 +978,22 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 	fd.LockFD.Init(&d.locks)
 	layerFDOpts := layerFD.Options()
 	if err := fd.vfsfd.Init(fd, layerFlags, mnt, &d.vfsd, &layerFDOpts); err != nil {
-		layerFD.DecRef()
+		layerFD.DecRef(ctx)
 		return nil, err
 	}
 	return &fd.vfsfd, nil
 }
 
-// Preconditions: parent.dirMu must be locked. parent does not already contain
-// a child named rp.Component().
-func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.ResolvingPath, parent *dentry, opts *vfs.OpenOptions, ds **[]*dentry) (*vfs.FileDescription, error) {
+// Preconditions:
+//   - parent.dirMu must be locked.
+//   - parent does not already contain a child named rp.Component().
+func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.ResolvingPath, parent *dentry, opts *vfs.OpenOptions, ds **[]*dentry, haveUpperWhiteout bool) (*vfs.FileDescription, error) {
 	creds := rp.Credentials()
 	if err := parent.checkPermissions(creds, vfs.MayWrite); err != nil {
 		return nil, err
 	}
 	if parent.vfsd.IsDead() {
-		return nil, syserror.ENOENT
+		return nil, linuxerr.ENOENT
 	}
 	mnt := rp.Mount()
 	if err := mnt.CheckBeginWrite(); err != nil {
@@ -858,19 +1012,12 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 		Start: parent.upperVD,
 		Path:  fspath.Parse(childName),
 	}
-	// We don't know if a whiteout exists on the upper layer; speculatively
-	// unlink it.
-	//
-	// TODO(gvisor.dev/issue/1199): Modify OpenAt => stepLocked so that we do
-	// know whether a whiteout exists.
-	var haveUpperWhiteout bool
-	switch err := vfsObj.UnlinkAt(ctx, fs.creds, &pop); err {
-	case nil:
-		haveUpperWhiteout = true
-	case syserror.ENOENT:
-		haveUpperWhiteout = false
-	default:
-		return nil, err
+	// Unlink the whiteout if it exists.
+	if haveUpperWhiteout {
+		if err := vfsObj.UnlinkAt(ctx, fs.creds, &pop); err != nil {
+			log.Warningf("overlay.filesystem.createAndOpenLocked: failed to unlink whiteout: %v", err)
+			return nil, err
+		}
 	}
 	// Create the file on the upper layer, and get an FD representing it.
 	upperFD, err := vfsObj.OpenAt(ctx, fs.creds, &pop, &vfs.OpenOptions{
@@ -883,17 +1030,14 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 		}
 		return nil, err
 	}
+
 	// Change the file's owner to the caller. We can't use upperFD.SetStat()
 	// because it will pick up creds from ctx.
 	if err := vfsObj.SetStatAt(ctx, fs.creds, &pop, &vfs.SetStatOptions{
-		Stat: linux.Statx{
-			Mask: linux.STATX_UID | linux.STATX_GID,
-			UID:  uint32(creds.EffectiveKUID),
-			GID:  uint32(creds.EffectiveKGID),
-		},
+		Stat: parent.newChildOwnerStat(opts.Mode, creds),
 	}); err != nil {
 		if cleanupErr := vfsObj.UnlinkAt(ctx, fs.creds, &pop); cleanupErr != nil {
-			ctx.Warningf("Unrecoverable overlayfs inconsistency: failed to delete upper layer file after OpenAt(O_CREAT) metadata update failure: %v", cleanupErr)
+			panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to delete upper layer file after OpenAt(O_CREAT) metadata update failure: %v", cleanupErr))
 		} else if haveUpperWhiteout {
 			fs.cleanupRecreateWhiteout(ctx, vfsObj, &pop)
 		}
@@ -901,18 +1045,21 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 	}
 	// Re-lookup to get a dentry representing the new file, which is needed for
 	// the returned FD.
-	child, err := fs.getChildLocked(ctx, parent, childName, ds)
+	child, _, err := fs.getChildLocked(ctx, parent, childName, ds)
 	if err != nil {
 		if cleanupErr := vfsObj.UnlinkAt(ctx, fs.creds, &pop); cleanupErr != nil {
-			ctx.Warningf("Unrecoverable overlayfs inconsistency: failed to delete upper layer file after OpenAt(O_CREAT) dentry lookup failure: %v", cleanupErr)
+			panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to delete upper layer file after OpenAt(O_CREAT) dentry lookup failure: %v", cleanupErr))
 		} else if haveUpperWhiteout {
 			fs.cleanupRecreateWhiteout(ctx, vfsObj, &pop)
 		}
 		return nil, err
 	}
-	// Finally construct the overlay FD.
+	// Finally construct the overlay FD. Below this point, we don't perform
+	// cleanup (the file was created successfully even if we can no longer open
+	// it for some reason).
+	parent.dirents = nil
 	upperFlags := upperFD.StatusFlags()
-	fd := &nonDirectoryFD{
+	fd := &regularFileFD{
 		copiedUp:    true,
 		cachedFD:    upperFD,
 		cachedFlags: upperFlags,
@@ -920,11 +1067,10 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 	fd.LockFD.Init(&child.locks)
 	upperFDOpts := upperFD.Options()
 	if err := fd.vfsfd.Init(fd, upperFlags, mnt, &child.vfsd, &upperFDOpts); err != nil {
-		upperFD.DecRef()
-		// Don't bother with cleanup; the file was created successfully, we
-		// just can't open it anymore for some reason.
+		upperFD.DecRef(ctx)
 		return nil, err
 	}
+	parent.watches.Notify(ctx, childName, linux.IN_CREATE, 0 /* cookie */, vfs.PathEvent, false /* unlinked */)
 	return &fd.vfsfd, nil
 }
 
@@ -932,7 +1078,7 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 func (fs *filesystem) ReadlinkAt(ctx context.Context, rp *vfs.ResolvingPath) (string, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		return "", err
@@ -946,40 +1092,288 @@ func (fs *filesystem) ReadlinkAt(ctx context.Context, rp *vfs.ResolvingPath) (st
 
 // RenameAt implements vfs.FilesystemImpl.RenameAt.
 func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldParentVD vfs.VirtualDentry, oldName string, opts vfs.RenameOptions) error {
-	if opts.Flags != 0 {
-		return syserror.EINVAL
-	}
-
+	// Resolve newParent first to verify that it's on this Mount.
 	var ds *[]*dentry
 	fs.renameMu.Lock()
-	defer fs.renameMuUnlockAndCheckDrop(&ds)
+	// We need to DecRef outside of fs.mu because forgetting a dead mountpoint
+	// could result in this filesystem being released which acquires fs.mu.
+	var toDecRef []refs.RefCounter
+	defer func() {
+		for _, ref := range toDecRef {
+			ref.DecRef(ctx)
+		}
+	}()
+	defer fs.renameMuUnlockAndCheckDrop(ctx, &ds)
 	newParent, err := fs.walkParentDirLocked(ctx, rp, rp.Start().Impl().(*dentry), &ds)
 	if err != nil {
 		return err
 	}
+
+	if opts.Flags&^linux.RENAME_NOREPLACE != 0 {
+		return linuxerr.EINVAL
+	}
+
 	newName := rp.Component()
 	if newName == "." || newName == ".." {
-		return syserror.EBUSY
+		if opts.Flags&linux.RENAME_NOREPLACE != 0 {
+			return linuxerr.EEXIST
+		}
+		return linuxerr.EBUSY
 	}
+	if uint64(len(newName)) > fs.maxFilenameLen {
+		return linuxerr.ENAMETOOLONG
+	}
+	// Do not check for newName length, since different filesystem
+	// implementations impose different name limits. upperfs.RenameAt() will fail
+	// appropriately if it has to.
 	mnt := rp.Mount()
 	if mnt != oldParentVD.Mount() {
-		return syserror.EXDEV
+		return linuxerr.EXDEV
 	}
 	if err := mnt.CheckBeginWrite(); err != nil {
 		return err
 	}
 	defer mnt.EndWrite()
 
-	// FIXME(gvisor.dev/issue/1199): Actually implement rename.
-	_ = newParent
-	return syserror.EXDEV
+	oldParent := oldParentVD.Dentry().Impl().(*dentry)
+	creds := rp.Credentials()
+	if err := oldParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
+		return err
+	}
+	// We need a dentry representing the renamed file since, if it's a
+	// directory, we need to check for write permission on it.
+	oldParent.dirMu.Lock()
+	defer oldParent.dirMu.Unlock()
+	renamed, _, err := fs.getChildLocked(ctx, oldParent, oldName, &ds)
+	if err != nil {
+		return err
+	}
+	if err := oldParent.mayDelete(creds, renamed); err != nil {
+		return err
+	}
+	if renamed.isDir() {
+		if renamed == newParent || genericIsAncestorDentry(renamed, newParent) {
+			return linuxerr.EINVAL
+		}
+		if oldParent != newParent {
+			if err := renamed.checkPermissions(creds, vfs.MayWrite); err != nil {
+				return err
+			}
+		}
+	} else {
+		if opts.MustBeDir || rp.MustBeDir() {
+			return linuxerr.ENOTDIR
+		}
+	}
+
+	if oldParent != newParent {
+		if err := newParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
+			return err
+		}
+		newParent.dirMu.NestedLock(dirLockNew)
+		defer newParent.dirMu.NestedUnlock(dirLockNew)
+	}
+	if newParent.vfsd.IsDead() {
+		return linuxerr.ENOENT
+	}
+	var (
+		replaced      *dentry
+		replacedVFSD  *vfs.Dentry
+		replacedLayer lookupLayer
+		whiteouts     map[string]bool
+	)
+	replaced, replacedLayer, err = fs.getChildLocked(ctx, newParent, newName, &ds)
+	if err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
+		return err
+	}
+	if replaced != nil {
+		if opts.Flags&linux.RENAME_NOREPLACE != 0 {
+			return linuxerr.EEXIST
+		}
+		replacedVFSD = &replaced.vfsd
+		if replaced.isDir() {
+			if !renamed.isDir() {
+				return linuxerr.EISDIR
+			}
+			if genericIsAncestorDentry(replaced, renamed) {
+				return linuxerr.ENOTEMPTY
+			}
+			replaced.dirMu.NestedLock(dirLockReplaced)
+			defer replaced.dirMu.NestedUnlock(dirLockReplaced)
+			whiteouts, err = replaced.collectWhiteoutsForRmdirLocked(ctx)
+			if err != nil {
+				return err
+			}
+		} else {
+			if rp.MustBeDir() || renamed.isDir() {
+				return linuxerr.ENOTDIR
+			}
+		}
+	}
+
+	if oldParent == newParent && oldName == newName {
+		return nil
+	}
+
+	// renamed and oldParent need to be copied-up before they're renamed on the
+	// upper layer.
+	if err := renamed.copyUpLocked(ctx); err != nil {
+		return err
+	}
+	// If renamed is a directory, all of its descendants need to be copied-up
+	// before they're renamed on the upper layer.
+	if renamed.isDir() {
+		if err := renamed.copyUpDescendantsLocked(ctx, &ds); err != nil {
+			return err
+		}
+	}
+	// newParent must be copied-up before it can contain renamed on the upper
+	// layer.
+	if err := newParent.copyUpLocked(ctx); err != nil {
+		return err
+	}
+	// If replaced exists, it doesn't need to be copied-up, but we do need to
+	// serialize with copy-up. Holding renameMu for writing should be
+	// sufficient, but out of an abundance of caution...
+	if replaced != nil {
+		replaced.copyMu.RLock()
+		defer replaced.copyMu.RUnlock()
+	}
+
+	vfsObj := rp.VirtualFilesystem()
+	mntns := vfs.MountNamespaceFromContext(ctx)
+	defer mntns.DecRef(ctx)
+	if err := vfsObj.PrepareRenameDentry(mntns, &renamed.vfsd, replacedVFSD); err != nil {
+		return err
+	}
+
+	newpop := vfs.PathOperation{
+		Root:  newParent.upperVD,
+		Start: newParent.upperVD,
+		Path:  fspath.Parse(newName),
+	}
+
+	needRecreateWhiteouts := false
+	cleanupRecreateWhiteouts := func() {
+		if !needRecreateWhiteouts {
+			return
+		}
+		for whiteoutName, whiteoutUpper := range whiteouts {
+			if !whiteoutUpper {
+				continue
+			}
+			if err := CreateWhiteout(ctx, vfsObj, fs.creds, &vfs.PathOperation{
+				Root:  replaced.upperVD,
+				Start: replaced.upperVD,
+				Path:  fspath.Parse(whiteoutName),
+			}); err != nil && !linuxerr.Equals(linuxerr.EEXIST, err) {
+				panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to recreate deleted whiteout after RenameAt failure: %v", err))
+			}
+		}
+	}
+	if renamed.isDir() {
+		if replacedLayer == lookupLayerUpper {
+			// Remove whiteouts from the directory being replaced.
+			needRecreateWhiteouts = true
+			for whiteoutName, whiteoutUpper := range whiteouts {
+				if !whiteoutUpper {
+					continue
+				}
+				if err := vfsObj.UnlinkAt(ctx, fs.creds, &vfs.PathOperation{
+					Root:  replaced.upperVD,
+					Start: replaced.upperVD,
+					Path:  fspath.Parse(whiteoutName),
+				}); err != nil {
+					vfsObj.AbortRenameDentry(&renamed.vfsd, replacedVFSD)
+					cleanupRecreateWhiteouts()
+					return err
+				}
+			}
+		} else if replacedLayer == lookupLayerUpperWhiteout {
+			// We need to explicitly remove the whiteout since otherwise rename
+			// on the upper layer will fail with ENOTDIR.
+			if err := vfsObj.UnlinkAt(ctx, fs.creds, &newpop); err != nil {
+				vfsObj.AbortRenameDentry(&renamed.vfsd, replacedVFSD)
+				return err
+			}
+		}
+	}
+
+	// Essentially no gVisor filesystem supports RENAME_WHITEOUT, so just do a
+	// regular rename and create the whiteout at the origin manually. Unlike
+	// RENAME_WHITEOUT, this isn't atomic with respect to other users of the
+	// upper filesystem, but this is already the case for virtually all other
+	// overlay filesystem operations too.
+	oldpop := vfs.PathOperation{
+		Root:  oldParent.upperVD,
+		Start: oldParent.upperVD,
+		Path:  fspath.Parse(oldName),
+	}
+	if err := vfsObj.RenameAt(ctx, creds, &oldpop, &newpop, &opts); err != nil {
+		vfsObj.AbortRenameDentry(&renamed.vfsd, replacedVFSD)
+		cleanupRecreateWhiteouts()
+		return err
+	}
+
+	// Below this point, the renamed dentry is now at newpop, and anything we
+	// replaced is gone forever. Commit the rename, update the overlay
+	// filesystem tree, and abandon attempts to recover from errors.
+	toDecRef = vfsObj.CommitRenameReplaceDentry(ctx, &renamed.vfsd, replacedVFSD)
+	delete(oldParent.children, oldName)
+	if replaced != nil {
+		// Lower dentries of replaced are not reachable from the overlay anymore.
+		// NOTE(b/237573779): Ask lower filesystem to release resources for this
+		// dentry whenever possible to reduce resource usage.
+		for _, replaceLower := range replaced.lowerVDs {
+			replaceLower.Dentry().MarkEvictable()
+		}
+		ds = appendDentry(ds, replaced)
+	}
+	if oldParent != newParent {
+		newParent.dirents = nil
+		// This can't drop the last reference on oldParent because one is held
+		// by oldParentVD, so lock recursion is impossible.
+		oldParent.DecRef(ctx)
+		ds = appendDentry(ds, oldParent)
+		newParent.IncRef()
+		renamed.parent.Store(newParent)
+	}
+	renamed.name = newName
+	if newParent.children == nil {
+		newParent.children = make(map[string]*dentry)
+	}
+	newParent.children[newName] = renamed
+	oldParent.dirents = nil
+
+	if err := CreateWhiteout(ctx, vfsObj, fs.creds, &oldpop); err != nil {
+		panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to create whiteout at origin after RenameAt: %v", err))
+	}
+	if renamed.isDir() {
+		if err := vfsObj.SetXattrAt(ctx, fs.creds, &newpop, &vfs.SetXattrOptions{
+			Name:  _OVL_XATTR_OPAQUE,
+			Value: "y",
+		}); err != nil {
+			panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to make renamed directory opaque: %v", err))
+		}
+	}
+
+	vfs.InotifyRename(ctx, &renamed.watches, &oldParent.watches, &newParent.watches, oldName, newName, renamed.isDir())
+	return nil
 }
 
 // RmdirAt implements vfs.FilesystemImpl.RmdirAt.
 func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
+	// We need to DecRef outside of fs.mu because forgetting a dead mountpoint
+	// could result in this filesystem being released which acquires fs.mu.
+	var toDecRef []refs.RefCounter
+	defer func() {
+		for _, ref := range toDecRef {
+			ref.DecRef(ctx)
+		}
+	}()
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	start := rp.Start().Impl().(*dentry)
 	parent, err := fs.walkParentDirLocked(ctx, rp, start, &ds)
 	if err != nil {
@@ -994,14 +1388,14 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	defer rp.Mount().EndWrite()
 	name := rp.Component()
 	if name == "." {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	if name == ".." {
-		return syserror.ENOTEMPTY
+		return linuxerr.ENOTEMPTY
 	}
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
-	defer mntns.DecRef()
+	defer mntns.DecRef(ctx)
 	parent.dirMu.Lock()
 	defer parent.dirMu.Unlock()
 
@@ -1011,17 +1405,20 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 		return err
 	}
 
-	// Unlike UnlinkAt, we need a dentry representing the child directory being
-	// removed in order to verify that it's empty.
-	child, err := fs.getChildLocked(ctx, parent, name, &ds)
+	// We need a dentry representing the child directory being removed in order
+	// to verify that it's empty.
+	child, _, err := fs.getChildLocked(ctx, parent, name, &ds)
 	if err != nil {
 		return err
 	}
 	if !child.isDir() {
-		return syserror.ENOTDIR
+		return linuxerr.ENOTDIR
 	}
-	child.dirMu.Lock()
-	defer child.dirMu.Unlock()
+	if err := parent.mayDelete(rp.Credentials(), child); err != nil {
+		return err
+	}
+	child.dirMu.NestedLock(dirLockChild)
+	defer child.dirMu.NestedUnlock(dirLockChild)
 	whiteouts, err := child.collectWhiteoutsForRmdirLocked(ctx)
 	if err != nil {
 		return err
@@ -1046,12 +1443,12 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 				if !whiteoutUpper {
 					continue
 				}
-				if err := fs.createWhiteout(ctx, vfsObj, &vfs.PathOperation{
+				if err := CreateWhiteout(ctx, vfsObj, fs.creds, &vfs.PathOperation{
 					Root:  child.upperVD,
 					Start: child.upperVD,
 					Path:  fspath.Parse(whiteoutName),
-				}); err != nil && err != syserror.EEXIST {
-					ctx.Warningf("Unrecoverable overlayfs inconsistency: failed to recreate deleted whiteout after RmdirAt failure: %v", err)
+				}); err != nil && !linuxerr.Equals(linuxerr.EEXIST, err) {
+					panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to recreate deleted whiteout after RmdirAt failure: %v", err))
 				}
 			}
 		}
@@ -1065,31 +1462,34 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 				Start: child.upperVD,
 				Path:  fspath.Parse(whiteoutName),
 			}); err != nil {
-				cleanupRecreateWhiteouts()
 				vfsObj.AbortDeleteDentry(&child.vfsd)
+				cleanupRecreateWhiteouts()
 				return err
 			}
 		}
 		// Remove the existing directory on the upper layer.
 		if err := vfsObj.RmdirAt(ctx, fs.creds, &pop); err != nil {
-			cleanupRecreateWhiteouts()
 			vfsObj.AbortDeleteDentry(&child.vfsd)
+			cleanupRecreateWhiteouts()
 			return err
 		}
 	}
-	if err := fs.createWhiteout(ctx, vfsObj, &pop); err != nil {
-		// Don't attempt to recover from this: the original directory is
-		// already gone, so any dentries representing it are invalid, and
-		// creating a new directory won't undo that.
-		ctx.Warningf("Unrecoverable overlayfs inconsistency: failed to create whiteout during RmdirAt: %v", err)
+	if err := CreateWhiteout(ctx, vfsObj, fs.creds, &pop); err != nil {
 		vfsObj.AbortDeleteDentry(&child.vfsd)
+		if child.upperVD.Ok() {
+			// Don't attempt to recover from this: the original directory is
+			// already gone, so any dentries representing it are invalid, and
+			// creating a new directory won't undo that.
+			panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to create whiteout after removing upper layer directory during RmdirAt: %v", err))
+		}
 		return err
 	}
 
-	vfsObj.CommitDeleteDentry(&child.vfsd)
+	toDecRef = vfsObj.CommitDeleteDentry(ctx, &child.vfsd)
 	delete(parent.children, name)
 	ds = appendDentry(ds, child)
 	parent.dirents = nil
+	parent.watches.Notify(ctx, name, linux.IN_DELETE|linux.IN_ISDIR, 0 /* cookie */, vfs.InodeEvent, true /* unlinked */)
 	return nil
 }
 
@@ -1097,14 +1497,27 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetStatOptions) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
+	if err != nil {
+		fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
+		return err
+	}
+	err = d.setStatLocked(ctx, rp, opts)
+	fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	if err != nil {
 		return err
 	}
 
-	mode := linux.FileMode(atomic.LoadUint32(&d.mode))
-	if err := vfs.CheckSetStat(ctx, rp.Credentials(), &opts.Stat, mode, auth.KUID(atomic.LoadUint32(&d.uid)), auth.KGID(atomic.LoadUint32(&d.gid))); err != nil {
+	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
+		d.InotifyWithParent(ctx, ev, 0 /* cookie */, vfs.InodeEvent)
+	}
+	return nil
+}
+
+// Precondition: d.fs.renameMu must be held for reading.
+func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetStatOptions) error {
+	mode := linux.FileMode(d.mode.Load())
+	if err := vfs.CheckSetStat(ctx, rp.Credentials(), &opts, mode, auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load())); err != nil {
 		return err
 	}
 	mnt := rp.Mount()
@@ -1132,7 +1545,7 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.StatOptions) (linux.Statx, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		return linux.Statx{}, err
@@ -1160,7 +1573,7 @@ func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linux.Statfs, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	_, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		return linux.Statfs{}, err
@@ -1170,7 +1583,7 @@ func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linu
 
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt.
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
-	return fs.doCreateAt(ctx, rp, false /* dir */, func(parent *dentry, childName string, haveUpperWhiteout bool) error {
+	return fs.doCreateAt(ctx, rp, createNonDirectory, func(parent *dentry, childName string, haveUpperWhiteout bool) error {
 		vfsObj := fs.vfsfs.VirtualFilesystem()
 		pop := vfs.PathOperation{
 			Root:  parent.upperVD,
@@ -1197,7 +1610,7 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 			},
 		}); err != nil {
 			if cleanupErr := vfsObj.UnlinkAt(ctx, fs.creds, &pop); cleanupErr != nil {
-				ctx.Warningf("Unrecoverable overlayfs inconsistency: failed to delete upper layer file after SymlinkAt metadata update failure: %v", cleanupErr)
+				panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to delete upper layer file after SymlinkAt metadata update failure: %v", cleanupErr))
 			} else if haveUpperWhiteout {
 				fs.cleanupRecreateWhiteout(ctx, vfsObj, &pop)
 			}
@@ -1211,7 +1624,16 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
+	// We need to DecRef outside of fs.renameMu because forgetting a dead
+	// mountpoint could result in this filesystem being released which acquires
+	// fs.renameMu.
+	var toDecRef []refs.RefCounter
+	defer func() {
+		for _, ref := range toDecRef {
+			ref.DecRef(ctx)
+		}
+	}()
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	start := rp.Start().Impl().(*dentry)
 	parent, err := fs.walkParentDirLocked(ctx, rp, start, &ds)
 	if err != nil {
@@ -1226,14 +1648,14 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	defer rp.Mount().EndWrite()
 	name := rp.Component()
 	if name == "." || name == ".." {
-		return syserror.EISDIR
+		return linuxerr.EISDIR
 	}
 	if rp.MustBeDir() {
-		return syserror.ENOTDIR
+		return linuxerr.ENOTDIR
 	}
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
-	defer mntns.DecRef()
+	defer mntns.DecRef(ctx)
 	parent.dirMu.Lock()
 	defer parent.dirMu.Unlock()
 
@@ -1243,36 +1665,24 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 		return err
 	}
 
-	child := parent.children[name]
-	var childLayer lookupLayer
-	if child != nil {
-		if child.isDir() {
-			return syserror.EISDIR
-		}
-		if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
-			return err
-		}
-		// Hold child.copyMu to prevent it from being copied-up during
-		// deletion.
-		child.copyMu.RLock()
-		defer child.copyMu.RUnlock()
-		if child.upperVD.Ok() {
-			childLayer = lookupLayerUpper
-		} else {
-			childLayer = lookupLayerLower
-		}
-	} else {
-		// Determine if the file being unlinked actually exists. Holding
-		// parent.dirMu prevents a dentry from being instantiated for the file,
-		// which in turn prevents it from being copied-up, so this result is
-		// stable.
-		childLayer, err = fs.lookupLayerLocked(ctx, parent, name)
-		if err != nil {
-			return err
-		}
-		if !childLayer.existsInOverlay() {
-			return syserror.ENOENT
-		}
+	// We need a dentry representing the child being removed in order to verify
+	// that it's not a directory.
+	child, childLayer, err := fs.getChildLocked(ctx, parent, name, &ds)
+	if err != nil {
+		return err
+	}
+	if child.isDir() {
+		return linuxerr.EISDIR
+	}
+	if err := parent.mayDelete(rp.Credentials(), child); err != nil {
+		return err
+	}
+	// Hold child.copyMu to prevent it from being copied-up during
+	// deletion.
+	child.copyMu.RLock()
+	defer child.copyMu.RUnlock()
+	if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
+		return err
 	}
 
 	pop := vfs.PathOperation{
@@ -1283,77 +1693,188 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	if childLayer == lookupLayerUpper {
 		// Remove the existing file on the upper layer.
 		if err := vfsObj.UnlinkAt(ctx, fs.creds, &pop); err != nil {
-			if child != nil {
-				vfsObj.AbortDeleteDentry(&child.vfsd)
-			}
+			vfsObj.AbortDeleteDentry(&child.vfsd)
 			return err
 		}
 	}
-	if err := fs.createWhiteout(ctx, vfsObj, &pop); err != nil {
-		ctx.Warningf("Unrecoverable overlayfs inconsistency: failed to create whiteout during UnlinkAt: %v", err)
-		if child != nil {
-			vfsObj.AbortDeleteDentry(&child.vfsd)
+	if err := CreateWhiteout(ctx, vfsObj, fs.creds, &pop); err != nil {
+		vfsObj.AbortDeleteDentry(&child.vfsd)
+		if childLayer == lookupLayerUpper {
+			panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to create whiteout after unlinking upper layer file during UnlinkAt: %v", err))
 		}
 		return err
 	}
 
-	if child != nil {
-		vfsObj.CommitDeleteDentry(&child.vfsd)
-		delete(parent.children, name)
-		ds = appendDentry(ds, child)
+	toDecRef = vfsObj.CommitDeleteDentry(ctx, &child.vfsd)
+	delete(parent.children, name)
+	if !child.isDir() {
+		// Once a whiteout is created, non-directory dentries on the lower layers
+		// are no longer reachable from the overlayfs. Ask filesystems to release
+		// their resources whenever possible.
+		for _, lowerDentry := range child.lowerVDs {
+			lowerDentry.Dentry().MarkEvictable()
+		}
 	}
+	ds = appendDentry(ds, child)
+	vfs.InotifyRemoveChild(ctx, &child.watches, &parent.watches, name)
 	parent.dirents = nil
 	return nil
 }
 
-// ListxattrAt implements vfs.FilesystemImpl.ListxattrAt.
-func (fs *filesystem) ListxattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
+// isOverlayXattr returns whether the given extended attribute configures the
+// overlay.
+func isOverlayXattr(name string) bool {
+	return strings.HasPrefix(name, _OVL_XATTR_PREFIX)
+}
+
+// ListXattrAt implements vfs.FilesystemImpl.ListXattrAt.
+func (fs *filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
-	_, err := fs.resolveLocked(ctx, rp, &ds)
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
+	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		return nil, err
 	}
-	// TODO(gvisor.dev/issue/1199): Linux overlayfs actually allows listxattr,
-	// but not any other xattr syscalls. For now we just reject all of them.
-	return nil, syserror.ENOTSUP
+
+	return fs.listXattr(ctx, d, size)
 }
 
-// GetxattrAt implements vfs.FilesystemImpl.GetxattrAt.
-func (fs *filesystem) GetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetxattrOptions) (string, error) {
+func (fs *filesystem) listXattr(ctx context.Context, d *dentry, size uint64) ([]string, error) {
+	vfsObj := d.fs.vfsfs.VirtualFilesystem()
+	top := d.topLayer()
+	names, err := vfsObj.ListXattrAt(ctx, fs.creds, &vfs.PathOperation{Root: top, Start: top}, size)
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter out all overlay attributes.
+	n := 0
+	for _, name := range names {
+		if !isOverlayXattr(name) {
+			names[n] = name
+			n++
+		}
+	}
+	return names[:n], err
+}
+
+// GetXattrAt implements vfs.FilesystemImpl.GetXattrAt.
+func (fs *filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetXattrOptions) (string, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
-	_, err := fs.resolveLocked(ctx, rp, &ds)
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
+	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
 		return "", err
 	}
-	return "", syserror.ENOTSUP
+
+	return fs.getXattr(ctx, d, rp.Credentials(), &opts)
 }
 
-// SetxattrAt implements vfs.FilesystemImpl.SetxattrAt.
-func (fs *filesystem) SetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetxattrOptions) error {
+func (fs *filesystem) getXattr(ctx context.Context, d *dentry, creds *auth.Credentials, opts *vfs.GetXattrOptions) (string, error) {
+	if err := d.checkXattrPermissions(creds, opts.Name, vfs.MayRead); err != nil {
+		return "", err
+	}
+
+	// Return EOPNOTSUPP when fetching an overlay attribute.
+	// See fs/overlayfs/super.c:ovl_own_xattr_get().
+	if isOverlayXattr(opts.Name) {
+		return "", linuxerr.EOPNOTSUPP
+	}
+
+	// Analogous to fs/overlayfs/super.c:ovl_other_xattr_get().
+	vfsObj := d.fs.vfsfs.VirtualFilesystem()
+	top := d.topLayer()
+	return vfsObj.GetXattrAt(ctx, fs.creds, &vfs.PathOperation{Root: top, Start: top}, opts)
+}
+
+// SetXattrAt implements vfs.FilesystemImpl.SetXattrAt.
+func (fs *filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetXattrOptions) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
-	_, err := fs.resolveLocked(ctx, rp, &ds)
+	d, err := fs.resolveLocked(ctx, rp, &ds)
+	if err != nil {
+		fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
+		return err
+	}
+
+	err = fs.setXattrLocked(ctx, d, rp.Mount(), rp.Credentials(), &opts)
+	fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	if err != nil {
 		return err
 	}
-	return syserror.ENOTSUP
+
+	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0 /* cookie */, vfs.InodeEvent)
+	return nil
 }
 
-// RemovexattrAt implements vfs.FilesystemImpl.RemovexattrAt.
-func (fs *filesystem) RemovexattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
+// Precondition: fs.renameMu must be locked.
+func (fs *filesystem) setXattrLocked(ctx context.Context, d *dentry, mnt *vfs.Mount, creds *auth.Credentials, opts *vfs.SetXattrOptions) error {
+	if err := d.checkXattrPermissions(creds, opts.Name, vfs.MayWrite); err != nil {
+		return err
+	}
+
+	// Return EOPNOTSUPP when setting an overlay attribute.
+	// See fs/overlayfs/super.c:ovl_own_xattr_set().
+	if isOverlayXattr(opts.Name) {
+		return linuxerr.EOPNOTSUPP
+	}
+
+	// Analogous to fs/overlayfs/super.c:ovl_other_xattr_set().
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return err
+	}
+	defer mnt.EndWrite()
+	if err := d.copyUpLocked(ctx); err != nil {
+		return err
+	}
+	vfsObj := d.fs.vfsfs.VirtualFilesystem()
+	return vfsObj.SetXattrAt(ctx, fs.creds, &vfs.PathOperation{Root: d.upperVD, Start: d.upperVD}, opts)
+}
+
+// RemoveXattrAt implements vfs.FilesystemImpl.RemoveXattrAt.
+func (fs *filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(&ds)
-	_, err := fs.resolveLocked(ctx, rp, &ds)
+	d, err := fs.resolveLocked(ctx, rp, &ds)
+	if err != nil {
+		fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
+		return err
+	}
+
+	err = fs.removeXattrLocked(ctx, d, rp.Mount(), rp.Credentials(), name)
+	fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
 	if err != nil {
 		return err
 	}
-	return syserror.ENOTSUP
+
+	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0 /* cookie */, vfs.InodeEvent)
+	return nil
+}
+
+// Precondition: fs.renameMu must be locked.
+func (fs *filesystem) removeXattrLocked(ctx context.Context, d *dentry, mnt *vfs.Mount, creds *auth.Credentials, name string) error {
+	if err := d.checkXattrPermissions(creds, name, vfs.MayWrite); err != nil {
+		return err
+	}
+
+	// Like SetXattrAt, return EOPNOTSUPP when removing an overlay attribute.
+	// Linux passes the remove request to xattr_handler->set.
+	// See fs/xattr.c:vfs_removexattr().
+	if isOverlayXattr(name) {
+		return linuxerr.EOPNOTSUPP
+	}
+
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return err
+	}
+	defer mnt.EndWrite()
+	if err := d.copyUpLocked(ctx); err != nil {
+		return err
+	}
+	vfsObj := d.fs.vfsfs.VirtualFilesystem()
+	return vfsObj.RemoveXattrAt(ctx, fs.creds, &vfs.PathOperation{Root: d.upperVD, Start: d.upperVD}, name)
 }
 
 // PrependPath implements vfs.FilesystemImpl.PrependPath.
@@ -1361,4 +1882,16 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 	fs.renameMu.RLock()
 	defer fs.renameMu.RUnlock()
 	return genericPrependPath(vfsroot, vd.Mount(), vd.Dentry().Impl().(*dentry), b)
+}
+
+// MountOptions implements vfs.FilesystemImpl.MountOptions.
+func (fs *filesystem) MountOptions() string {
+	// Return the mount options from the topmost layer.
+	var vd vfs.VirtualDentry
+	if fs.opts.UpperRoot.Ok() {
+		vd = fs.opts.UpperRoot
+	} else {
+		vd = fs.opts.LowerRoots[0]
+	}
+	return vd.Mount().Filesystem().Impl().MountOptions()
 }

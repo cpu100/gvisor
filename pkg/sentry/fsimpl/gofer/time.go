@@ -15,30 +15,22 @@
 package gofer
 
 import (
-	"sync/atomic"
-
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
-func dentryTimestampFromP9(s, ns uint64) int64 {
-	return int64(s*1e9 + ns)
+func dentryTimestamp(t linux.StatxTimestamp) int64 {
+	return t.ToNsec()
 }
 
-func dentryTimestampFromStatx(ts linux.StatxTimestamp) int64 {
-	return ts.Sec*1e9 + int64(ts.Nsec)
+func dentryTimestampFromUnix(t unix.Timespec) int64 {
+	return dentryTimestamp(linux.StatxTimestamp{Sec: t.Sec, Nsec: uint32(t.Nsec)})
 }
 
-func statxTimestampFromDentry(ns int64) linux.StatxTimestamp {
-	return linux.StatxTimestamp{
-		Sec:  ns / 1e9,
-		Nsec: uint32(ns % 1e9),
-	}
-}
-
-// Preconditions: fs.interop != InteropModeShared.
+// Preconditions: d.cachedMetadataAuthoritative() == true.
 func (d *dentry) touchAtime(mnt *vfs.Mount) {
-	if mnt.Flags.NoATime {
+	if mnt.Flags.NoATime || mnt.ReadOnly() {
 		return
 	}
 	if err := mnt.CheckBeginWrite(); err != nil {
@@ -46,32 +38,54 @@ func (d *dentry) touchAtime(mnt *vfs.Mount) {
 	}
 	now := d.fs.clock.Now().Nanoseconds()
 	d.metadataMu.Lock()
-	atomic.StoreInt64(&d.atime, now)
+	d.atime.Store(now)
+	d.atimeDirty.Store(1)
 	d.metadataMu.Unlock()
 	mnt.EndWrite()
 }
 
-// Preconditions: fs.interop != InteropModeShared. The caller has successfully
-// called vfs.Mount.CheckBeginWrite().
+// Preconditions: d.metadataMu is locked. d.cachedMetadataAuthoritative() == true.
+func (d *dentry) touchAtimeLocked(mnt *vfs.Mount) {
+	if mnt.Flags.NoATime || mnt.ReadOnly() {
+		return
+	}
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return
+	}
+	now := d.fs.clock.Now().Nanoseconds()
+	d.atime.Store(now)
+	d.atimeDirty.Store(1)
+	mnt.EndWrite()
+}
+
+// Preconditions:
+//   - d.cachedMetadataAuthoritative() == true.
+//   - The caller has successfully called vfs.Mount.CheckBeginWrite().
 func (d *dentry) touchCtime() {
 	now := d.fs.clock.Now().Nanoseconds()
 	d.metadataMu.Lock()
-	atomic.StoreInt64(&d.ctime, now)
+	d.ctime.Store(now)
 	d.metadataMu.Unlock()
 }
 
-// Preconditions: fs.interop != InteropModeShared. The caller has successfully
-// called vfs.Mount.CheckBeginWrite().
+// Preconditions:
+//   - d.cachedMetadataAuthoritative() == true.
+//   - The caller has successfully called vfs.Mount.CheckBeginWrite().
 func (d *dentry) touchCMtime() {
 	now := d.fs.clock.Now().Nanoseconds()
 	d.metadataMu.Lock()
-	atomic.StoreInt64(&d.mtime, now)
-	atomic.StoreInt64(&d.ctime, now)
+	d.mtime.Store(now)
+	d.ctime.Store(now)
+	d.mtimeDirty.Store(1)
 	d.metadataMu.Unlock()
 }
 
+// Preconditions:
+//   - d.cachedMetadataAuthoritative() == true.
+//   - The caller has locked d.metadataMu.
 func (d *dentry) touchCMtimeLocked() {
 	now := d.fs.clock.Now().Nanoseconds()
-	atomic.StoreInt64(&d.mtime, now)
-	atomic.StoreInt64(&d.ctime, now)
+	d.mtime.Store(now)
+	d.ctime.Store(now)
+	d.mtimeDirty.Store(1)
 }

@@ -19,19 +19,23 @@ import (
 	"runtime/trace"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // BlockWithTimeout blocks t until an event is received from C, the application
 // monotonic clock indicates that timeout has elapsed (only if haveTimeout is true),
 // or t is interrupted. It returns:
 //
-// - The remaining timeout, which is guaranteed to be 0 if the timeout expired,
-// and is unspecified if haveTimeout is false.
+//   - The remaining timeout, which is guaranteed to be 0 if the timeout expired,
+//     and is unspecified if haveTimeout is false.
 //
-// - An error which is nil if an event is received from C, ETIMEDOUT if the timeout
-// expired, and syserror.ErrInterrupted if t is interrupted.
+//   - An error which is nil if an event is received from C, ETIMEDOUT if the timeout
+//     expired, and linuxerr.ErrInterrupted if t is interrupted.
+//
+// Preconditions: The caller must be running on the task goroutine.
 func (t *Task) BlockWithTimeout(C chan struct{}, haveTimeout bool, timeout time.Duration) (time.Duration, error) {
 	if !haveTimeout {
 		return timeout, t.block(C, nil)
@@ -42,7 +46,7 @@ func (t *Task) BlockWithTimeout(C chan struct{}, haveTimeout bool, timeout time.
 	err := t.BlockWithDeadline(C, true, deadline)
 
 	// Timeout, explicitly return a remaining duration of 0.
-	if err == syserror.ETIMEDOUT {
+	if linuxerr.Equals(linuxerr.ETIMEDOUT, err) {
 		return 0, err
 	}
 
@@ -59,14 +63,23 @@ func (t *Task) BlockWithTimeout(C chan struct{}, haveTimeout bool, timeout time.
 	return remainingTimeout, err
 }
 
-// BlockWithDeadline blocks t until an event is received from C, the
+// BlockWithTimeoutOn implements context.Context.BlockWithTimeoutOn.
+func (t *Task) BlockWithTimeoutOn(w waiter.Waitable, mask waiter.EventMask, timeout time.Duration) (time.Duration, bool) {
+	e, ch := waiter.NewChannelEntry(mask)
+	w.EventRegister(&e)
+	defer w.EventUnregister(&e)
+	left, err := t.BlockWithTimeout(ch, true, timeout)
+	return left, err == nil
+}
+
+// BlockWithDeadline blocks t until it is woken by an event, the
 // application monotonic clock indicates a time of deadline (only if
 // haveDeadline is true), or t is interrupted. It returns nil if an event is
 // received from C, ETIMEDOUT if the deadline expired, and
-// syserror.ErrInterrupted if t is interrupted.
+// linuxerr.ErrInterrupted if t is interrupted.
 //
 // Preconditions: The caller must be running on the task goroutine.
-func (t *Task) BlockWithDeadline(C chan struct{}, haveDeadline bool, deadline ktime.Time) error {
+func (t *Task) BlockWithDeadline(C <-chan struct{}, haveDeadline bool, deadline ktime.Time) error {
 	if !haveDeadline {
 		return t.block(C, nil)
 	}
@@ -91,7 +104,7 @@ func (t *Task) BlockWithDeadline(C chan struct{}, haveDeadline bool, deadline kt
 
 // BlockWithTimer blocks t until an event is received from C or tchan, or t is
 // interrupted. It returns nil if an event is received from C, ETIMEDOUT if an
-// event is received from tchan, and syserror.ErrInterrupted if t is
+// event is received from tchan, and linuxerr.ErrInterrupted if t is
 // interrupted.
 //
 // Most clients should use BlockWithDeadline or BlockWithTimeout instead.
@@ -101,18 +114,30 @@ func (t *Task) BlockWithTimer(C <-chan struct{}, tchan <-chan struct{}) error {
 	return t.block(C, tchan)
 }
 
-// Block blocks t until an event is received from C or t is interrupted. It
-// returns nil if an event is received from C and syserror.ErrInterrupted if t
-// is interrupted.
-//
-// Preconditions: The caller must be running on the task goroutine.
+// Block implements context.Context.Block
 func (t *Task) Block(C <-chan struct{}) error {
 	return t.block(C, nil)
 }
 
+// BlockOn implements context.Context.BlockOn.
+func (t *Task) BlockOn(w waiter.Waitable, mask waiter.EventMask) bool {
+	e, ch := waiter.NewChannelEntry(mask)
+	w.EventRegister(&e)
+	defer w.EventUnregister(&e)
+	err := t.Block(ch)
+	return err == nil
+}
+
 // block blocks a task on one of many events.
 // N.B. defer is too expensive to be used here.
+//
+// Preconditions: The caller must be running on the task goroutine.
 func (t *Task) block(C <-chan struct{}, timerChan <-chan struct{}) error {
+	// This function is very hot; skip this check outside of +race builds.
+	if sync.RaceEnabled {
+		t.assertTaskGoroutine()
+	}
+
 	// Fast path if the request is already done.
 	select {
 	case <-C:
@@ -121,7 +146,8 @@ func (t *Task) block(C <-chan struct{}, timerChan <-chan struct{}) error {
 	}
 
 	// Deactive our address space, we don't need it.
-	interrupt := t.SleepStart()
+	t.prepareSleep()
+	defer t.completeSleep()
 
 	// If the request is not completed, but the timer has already expired,
 	// then ensure that we run through a scheduler cycle. This is because
@@ -138,51 +164,52 @@ func (t *Task) block(C <-chan struct{}, timerChan <-chan struct{}) error {
 	select {
 	case <-C:
 		region.End()
-		t.SleepFinish(true)
 		// Woken by event.
 		return nil
 
-	case <-interrupt:
+	case <-t.interruptChan:
 		region.End()
-		t.SleepFinish(false)
+		// Ensure that Task.interrupted() will return true once we return to
+		// the task run loop.
+		t.interruptSelf()
 		// Return the indicated error on interrupt.
-		return syserror.ErrInterrupted
+		return linuxerr.ErrInterrupted
 
 	case <-timerChan:
 		region.End()
-		t.SleepFinish(true)
 		// We've timed out.
-		return syserror.ETIMEDOUT
+		return linuxerr.ETIMEDOUT
 	}
 }
 
-// SleepStart implements amutex.Sleeper.SleepStart.
-func (t *Task) SleepStart() <-chan struct{} {
+// prepareSleep prepares to sleep.
+func (t *Task) prepareSleep() {
+	t.assertTaskGoroutine()
+	t.p.PrepareSleep()
 	t.Deactivate()
 	t.accountTaskGoroutineEnter(TaskGoroutineBlockedInterruptible)
-	return t.interruptChan
 }
 
-// SleepFinish implements amutex.Sleeper.SleepFinish.
-func (t *Task) SleepFinish(success bool) {
-	if !success {
-		// The interrupted notification is consumed only at the top-level
-		// (Run). Therefore we attempt to reset the pending notification.
-		// This will also elide our next entry back into the task, so we
-		// will process signals, state changes, etc.
-		t.interruptSelf()
-	}
+// completeSleep reactivates the address space.
+func (t *Task) completeSleep() {
 	t.accountTaskGoroutineLeave(TaskGoroutineBlockedInterruptible)
 	t.Activate()
 }
 
-// Interrupted implements amutex.Sleeper.Interrupted
+// Interrupted implements context.Context.Interrupted.
 func (t *Task) Interrupted() bool {
-	return len(t.interruptChan) != 0
+	if t.interrupted() {
+		return true
+	}
+	// Indicate that t's task goroutine is still responsive (i.e. reset the
+	// watchdog timer).
+	t.accountTaskGoroutineRunning()
+	return false
 }
 
 // UninterruptibleSleepStart implements context.Context.UninterruptibleSleepStart.
 func (t *Task) UninterruptibleSleepStart(deactivate bool) {
+	t.assertTaskGoroutine()
 	if deactivate {
 		t.Deactivate()
 	}
@@ -198,13 +225,17 @@ func (t *Task) UninterruptibleSleepFinish(activate bool) {
 }
 
 // interrupted returns true if interrupt or interruptSelf has been called at
-// least once since the last call to interrupted.
+// least once since the last call to unsetInterrupted.
 func (t *Task) interrupted() bool {
+	return len(t.interruptChan) != 0
+}
+
+// unsetInterrupted causes interrupted to return false until the next call to
+// interrupt or interruptSelf.
+func (t *Task) unsetInterrupted() {
 	select {
 	case <-t.interruptChan:
-		return true
 	default:
-		return false
 	}
 }
 
@@ -220,11 +251,14 @@ func (t *Task) interrupt() {
 func (t *Task) interruptSelf() {
 	select {
 	case t.interruptChan <- struct{}{}:
-		t.Debugf("Interrupt queued")
 	default:
-		t.Debugf("Dropping duplicate interrupt")
 	}
 	// platform.Context.Interrupt() is unnecessary since a task goroutine
 	// calling interruptSelf() cannot also be blocked in
 	// platform.Context.Switch().
+}
+
+// Interrupt implements context.Blocker.Interrupt.
+func (t *Task) Interrupt() {
+	t.interrupt()
 }

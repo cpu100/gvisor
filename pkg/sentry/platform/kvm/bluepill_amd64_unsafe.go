@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build amd64
 // +build amd64
 
 package kvm
 
 import (
-	"syscall"
 	"unsafe"
 
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
 )
 
 // dieArchSetup initializes the state for dieTrampoline.
@@ -68,10 +69,10 @@ func getHypercallID(addr uintptr) int {
 func bluepillStopGuest(c *vCPU) {
 	// Interrupt: we must have requested an interrupt
 	// window; set the interrupt line.
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
+	if _, _, errno := unix.RawSyscall(
+		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_INTERRUPT,
+		KVM_INTERRUPT,
 		uintptr(unsafe.Pointer(&bounce))); errno != 0 {
 		throw("interrupt injection failed")
 	}
@@ -79,9 +80,64 @@ func bluepillStopGuest(c *vCPU) {
 	c.runData.requestInterruptWindow = 0
 }
 
+// bluepillSigBus is reponsible for injecting NMI to trigger sigbus.
+//
+//go:nosplit
+func bluepillSigBus(c *vCPU) {
+	if _, _, errno := unix.RawSyscall( // escapes: no.
+		unix.SYS_IOCTL,
+		uintptr(c.fd),
+		KVM_NMI, 0); errno != 0 {
+		throw("NMI injection failed")
+	}
+}
+
+// bluepillHandleEnosys is reponsible for handling enosys error.
+//
+//go:nosplit
+func bluepillHandleEnosys(c *vCPU) {
+	throw("run failed: ENOSYS")
+}
+
 // bluepillReadyStopGuest checks whether the current vCPU is ready for interrupt injection.
 //
 //go:nosplit
 func bluepillReadyStopGuest(c *vCPU) bool {
-	return c.runData.readyForInterruptInjection != 0
+	if c.runData.readyForInterruptInjection == 0 {
+		return false
+	}
+
+	if c.runData.ifFlag == 0 {
+		// This is impossible if readyForInterruptInjection is 1.
+		throw("interrupts are disabled")
+	}
+
+	// Disable interrupts if we are in the kernel space.
+	//
+	// When the Sentry switches into the kernel mode, it disables
+	// interrupts. But when goruntime switches on a goroutine which has
+	// been saved in the host mode, it restores flags and this enables
+	// interrupts.  See the comment of UserFlagsSet for more details.
+	uregs := userRegs{}
+	err := c.getUserRegisters(&uregs)
+	if err != 0 {
+		throw("failed to get user registers")
+	}
+
+	if ring0.IsKernelFlags(uregs.RFLAGS) {
+		uregs.RFLAGS &^= ring0.KernelFlagsClear
+		err = c.setUserRegisters(&uregs)
+		if err != 0 {
+			throw("failed to set user registers")
+		}
+		return false
+	}
+	return true
+}
+
+// bluepillArchHandleExit checks architecture specific exitcode.
+//
+//go:nosplit
+func bluepillArchHandleExit(c *vCPU, context unsafe.Pointer) {
+	c.die(bluepillArchContext(context), "unknown")
 }

@@ -12,20 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build amd64
 // +build amd64
 
 package filter
 
 import (
-	"syscall"
-
-	"gvisor.dev/gvisor/pkg/abi/linux"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/seccomp"
 )
 
 func init() {
-	allowedSyscalls[syscall.SYS_ARCH_PRCTL] = append(allowedSyscalls[syscall.SYS_ARCH_PRCTL],
-		seccomp.Rule{seccomp.AllowValue(linux.ARCH_GET_FS)},
-		seccomp.Rule{seccomp.AllowValue(linux.ARCH_SET_FS)},
-	)
+	allowedSyscalls.Set(unix.SYS_CLONE, seccomp.PerArg{
+		// parent_tidptr and child_tidptr are always 0 because neither
+		// CLONE_PARENT_SETTID nor CLONE_CHILD_SETTID are used.
+		seccomp.EqualTo(
+			unix.CLONE_VM |
+				unix.CLONE_FS |
+				unix.CLONE_FILES |
+				unix.CLONE_SETTLS |
+				unix.CLONE_SIGHAND |
+				unix.CLONE_SYSVSEM |
+				unix.CLONE_THREAD),
+		seccomp.AnyValue{}, // newsp
+		seccomp.EqualTo(0), // parent_tidptr
+		seccomp.EqualTo(0), // child_tidptr
+		seccomp.AnyValue{}, // tls
+	})
+}
+
+func archFstatAtSysNo() uintptr {
+	return unix.SYS_NEWFSTATAT
 }

@@ -3,18 +3,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build go1.13
-// +build !go1.16
-
-// Check go:linkname function signatures when updating Go version.
-
 // This is mostly copied from the standard library's sync/rwmutex.go.
 //
 // Happens-before relationships indicated to the race detector:
-// - Unlock -> Lock (via writerSem)
-// - Unlock -> RLock (via readerSem)
-// - RUnlock -> Lock (via writerSem)
-// - DowngradeLock -> RLock (via readerSem)
+//	- Unlock -> Lock (via writerSem)
+//	- Unlock -> RLock (via readerSem)
+//	- RUnlock -> Lock (via writerSem)
+//	- DowngradeLock -> RLock (via readerSem)
 
 package sync
 
@@ -23,16 +18,15 @@ import (
 	"unsafe"
 )
 
-//go:linkname runtimeSemacquire sync.runtime_Semacquire
-func runtimeSemacquire(s *uint32)
-
-//go:linkname runtimeSemrelease sync.runtime_Semrelease
-func runtimeSemrelease(s *uint32, handoff bool, skipframes int)
-
-// RWMutex is identical to sync.RWMutex, but adds the DowngradeLock,
-// TryLock and TryRLock methods.
-type RWMutex struct {
-	w           Mutex  // held if there are pending writers
+// CrossGoroutineRWMutex is equivalent to RWMutex, but it need not be unlocked
+// by a the same goroutine that locked the mutex.
+type CrossGoroutineRWMutex struct {
+	// w is held if there are pending writers
+	//
+	// We use CrossGoroutineMutex rather than Mutex because the lock
+	// annotation instrumentation in Mutex will trigger false positives in
+	// the race detector when called inside of RaceDisable.
+	w           CrossGoroutineMutex
 	writerSem   uint32 // semaphore for writers to wait for completing readers
 	readerSem   uint32 // semaphore for readers to wait for completing writers
 	readerCount int32  // number of pending readers
@@ -43,7 +37,8 @@ const rwmutexMaxReaders = 1 << 30
 
 // TryRLock locks rw for reading. It returns true if it succeeds and false
 // otherwise. It does not block.
-func (rw *RWMutex) TryRLock() bool {
+// +checklocksignore
+func (rw *CrossGoroutineRWMutex) TryRLock() bool {
 	if RaceEnabled {
 		RaceDisable()
 	}
@@ -67,13 +62,18 @@ func (rw *RWMutex) TryRLock() bool {
 }
 
 // RLock locks rw for reading.
-func (rw *RWMutex) RLock() {
+//
+// It should not be used for recursive read locking; a blocked Lock call
+// excludes new readers from acquiring the lock. See the documentation on the
+// RWMutex type.
+// +checklocksignore
+func (rw *CrossGoroutineRWMutex) RLock() {
 	if RaceEnabled {
 		RaceDisable()
 	}
 	if atomic.AddInt32(&rw.readerCount, 1) < 0 {
 		// A writer is pending, wait for it.
-		runtimeSemacquire(&rw.readerSem)
+		semacquire(&rw.readerSem)
 	}
 	if RaceEnabled {
 		RaceEnable()
@@ -82,7 +82,12 @@ func (rw *RWMutex) RLock() {
 }
 
 // RUnlock undoes a single RLock call.
-func (rw *RWMutex) RUnlock() {
+//
+// Preconditions:
+//   - rw is locked for reading.
+//
+// +checklocksignore
+func (rw *CrossGoroutineRWMutex) RUnlock() {
 	if RaceEnabled {
 		RaceReleaseMerge(unsafe.Pointer(&rw.writerSem))
 		RaceDisable()
@@ -94,7 +99,7 @@ func (rw *RWMutex) RUnlock() {
 		// A writer is pending.
 		if atomic.AddInt32(&rw.readerWait, -1) == 0 {
 			// The last reader unblocks the writer.
-			runtimeSemrelease(&rw.writerSem, false, 0)
+			semrelease(&rw.writerSem, false, 0)
 		}
 	}
 	if RaceEnabled {
@@ -104,7 +109,8 @@ func (rw *RWMutex) RUnlock() {
 
 // TryLock locks rw for writing. It returns true if it succeeds and false
 // otherwise. It does not block.
-func (rw *RWMutex) TryLock() bool {
+// +checklocksignore
+func (rw *CrossGoroutineRWMutex) TryLock() bool {
 	if RaceEnabled {
 		RaceDisable()
 	}
@@ -130,8 +136,10 @@ func (rw *RWMutex) TryLock() bool {
 	return true
 }
 
-// Lock locks rw for writing.
-func (rw *RWMutex) Lock() {
+// Lock locks rw for writing. If the lock is already locked for reading or
+// writing, Lock blocks until the lock is available.
+// +checklocksignore
+func (rw *CrossGoroutineRWMutex) Lock() {
 	if RaceEnabled {
 		RaceDisable()
 	}
@@ -141,7 +149,7 @@ func (rw *RWMutex) Lock() {
 	r := atomic.AddInt32(&rw.readerCount, -rwmutexMaxReaders) + rwmutexMaxReaders
 	// Wait for active readers.
 	if r != 0 && atomic.AddInt32(&rw.readerWait, r) != 0 {
-		runtimeSemacquire(&rw.writerSem)
+		semacquire(&rw.writerSem)
 	}
 	if RaceEnabled {
 		RaceEnable()
@@ -150,7 +158,12 @@ func (rw *RWMutex) Lock() {
 }
 
 // Unlock unlocks rw for writing.
-func (rw *RWMutex) Unlock() {
+//
+// Preconditions:
+//   - rw is locked for writing.
+//
+// +checklocksignore
+func (rw *CrossGoroutineRWMutex) Unlock() {
 	if RaceEnabled {
 		RaceRelease(unsafe.Pointer(&rw.writerSem))
 		RaceRelease(unsafe.Pointer(&rw.readerSem))
@@ -163,7 +176,7 @@ func (rw *RWMutex) Unlock() {
 	}
 	// Unblock blocked readers, if any.
 	for i := 0; i < int(r); i++ {
-		runtimeSemrelease(&rw.readerSem, false, 0)
+		semrelease(&rw.readerSem, false, 0)
 	}
 	// Allow other writers to proceed.
 	rw.w.Unlock()
@@ -173,7 +186,12 @@ func (rw *RWMutex) Unlock() {
 }
 
 // DowngradeLock atomically unlocks rw for writing and locks it for reading.
-func (rw *RWMutex) DowngradeLock() {
+//
+// Preconditions:
+//   - rw is locked for writing.
+//
+// +checklocksignore
+func (rw *CrossGoroutineRWMutex) DowngradeLock() {
 	if RaceEnabled {
 		RaceRelease(unsafe.Pointer(&rw.readerSem))
 		RaceDisable()
@@ -186,7 +204,7 @@ func (rw *RWMutex) DowngradeLock() {
 	// Unblock blocked readers, if any. Note that this loop starts as 1 since r
 	// includes this goroutine.
 	for i := 1; i < int(r); i++ {
-		runtimeSemrelease(&rw.readerSem, false, 0)
+		semrelease(&rw.readerSem, false, 0)
 	}
 	// Allow other writers to proceed to rw.w.Lock(). Note that they will still
 	// block on rw.writerSem since at least this reader exists, such that
@@ -195,4 +213,102 @@ func (rw *RWMutex) DowngradeLock() {
 	if RaceEnabled {
 		RaceEnable()
 	}
+}
+
+// A RWMutex is a reader/writer mutual exclusion lock. The lock can be held by
+// an arbitrary number of readers or a single writer. The zero value for a
+// RWMutex is an unlocked mutex.
+//
+// A RWMutex must not be copied after first use.
+//
+// If a goroutine holds a RWMutex for reading and another goroutine might call
+// Lock, no goroutine should expect to be able to acquire a read lock until the
+// initial read lock is released. In particular, this prohibits recursive read
+// locking. This is to ensure that the lock eventually becomes available; a
+// blocked Lock call excludes new readers from acquiring the lock.
+//
+// A Mutex must be unlocked by the same goroutine that locked it. This
+// invariant is enforced with the 'checklocks' build tag.
+type RWMutex struct {
+	m CrossGoroutineRWMutex
+}
+
+// TryRLock locks rw for reading. It returns true if it succeeds and false
+// otherwise. It does not block.
+// +checklocksignore
+func (rw *RWMutex) TryRLock() bool {
+	// Note lock first to enforce proper locking even if unsuccessful.
+	noteLock(unsafe.Pointer(rw))
+	locked := rw.m.TryRLock()
+	if !locked {
+		noteUnlock(unsafe.Pointer(rw))
+	}
+	return locked
+}
+
+// RLock locks rw for reading.
+//
+// It should not be used for recursive read locking; a blocked Lock call
+// excludes new readers from acquiring the lock. See the documentation on the
+// RWMutex type.
+// +checklocksignore
+func (rw *RWMutex) RLock() {
+	noteLock(unsafe.Pointer(rw))
+	rw.m.RLock()
+}
+
+// RUnlock undoes a single RLock call.
+//
+// Preconditions:
+//   - rw is locked for reading.
+//   - rw was locked by this goroutine.
+//
+// +checklocksignore
+func (rw *RWMutex) RUnlock() {
+	rw.m.RUnlock()
+	noteUnlock(unsafe.Pointer(rw))
+}
+
+// TryLock locks rw for writing. It returns true if it succeeds and false
+// otherwise. It does not block.
+// +checklocksignore
+func (rw *RWMutex) TryLock() bool {
+	// Note lock first to enforce proper locking even if unsuccessful.
+	noteLock(unsafe.Pointer(rw))
+	locked := rw.m.TryLock()
+	if !locked {
+		noteUnlock(unsafe.Pointer(rw))
+	}
+	return locked
+}
+
+// Lock locks rw for writing. If the lock is already locked for reading or
+// writing, Lock blocks until the lock is available.
+// +checklocksignore
+func (rw *RWMutex) Lock() {
+	noteLock(unsafe.Pointer(rw))
+	rw.m.Lock()
+}
+
+// Unlock unlocks rw for writing.
+//
+// Preconditions:
+//   - rw is locked for writing.
+//   - rw was locked by this goroutine.
+//
+// +checklocksignore
+func (rw *RWMutex) Unlock() {
+	rw.m.Unlock()
+	noteUnlock(unsafe.Pointer(rw))
+}
+
+// DowngradeLock atomically unlocks rw for writing and locks it for reading.
+//
+// Preconditions:
+//   - rw is locked for writing.
+//
+// +checklocksignore
+func (rw *RWMutex) DowngradeLock() {
+	// No note change for DowngradeLock.
+	rw.m.DowngradeLock()
 }

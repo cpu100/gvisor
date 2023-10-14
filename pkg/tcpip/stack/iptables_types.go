@@ -15,8 +15,8 @@
 package stack
 
 import (
+	"fmt"
 	"strings"
-	"sync"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -24,19 +24,18 @@ import (
 
 // A Hook specifies one of the hooks built into the network stack.
 //
-//                      Userspace app          Userspace app
-//                            ^                      |
-//                            |                      v
-//                         [Input]               [Output]
-//                            ^                      |
-//                            |                      v
-//                            |                   routing
-//                            |                      |
-//                            |                      v
-// ----->[Prerouting]----->routing----->[Forward]---------[Postrouting]----->
+//	                     Userspace app          Userspace app
+//	                           ^                      |
+//	                           |                      v
+//	                        [Input]               [Output]
+//	                           ^                      |
+//	                           |                      v
+//	                           |                   routing
+//	                           |                      |
+//	                           |                      v
+//		----->[Prerouting]----->routing----->[Forward]---------[Postrouting]----->
 type Hook uint
 
-// These values correspond to values in include/uapi/linux/netfilter.h.
 const (
 	// Prerouting happens before a packet is routed to applications or to
 	// be forwarded.
@@ -56,7 +55,7 @@ const (
 	// Postrouting happens just before a packet goes out on the wire.
 	Postrouting
 
-	// The total number of hooks.
+	// NumHooks is the total number of hooks.
 	NumHooks
 )
 
@@ -78,50 +77,85 @@ const (
 )
 
 // IPTables holds all the tables for a netstack.
+//
+// +stateify savable
 type IPTables struct {
-	// mu protects tables, priorities, and modified.
-	mu sync.RWMutex
+	connections ConnTrack
 
-	// tables maps table names to tables. User tables have arbitrary names.
-	// mu needs to be locked for accessing.
-	tables map[string]Table
+	reaper tcpip.Timer
 
-	// priorities maps each hook to a list of table names. The order of the
-	// list is the order in which each table should be visited for that
-	// hook. mu needs to be locked for accessing.
-	priorities map[Hook][]string
-
+	mu ipTablesRWMutex
+	// v4Tables and v6tables map tableIDs to tables. They hold builtin
+	// tables only, not user tables.
+	//
+	// mu protects the array of tables, but not the tables themselves.
+	// +checklocks:mu
+	v4Tables [NumTables]Table
+	//
+	// mu protects the array of tables, but not the tables themselves.
+	// +checklocks:mu
+	v6Tables [NumTables]Table
 	// modified is whether tables have been modified at least once. It is
 	// used to elide the iptables performance overhead for workloads that
 	// don't utilize iptables.
+	//
+	// +checklocks:mu
 	modified bool
-
-	connections ConnTrack
 }
 
-// A Table defines a set of chains and hooks into the network stack. It is
-// really just a list of rules.
+// VisitTargets traverses all the targets of all tables and replaces each with
+// transform(target).
+func (it *IPTables) VisitTargets(transform func(Target) Target) {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
+	for tid := range it.v4Tables {
+		for i, rule := range it.v4Tables[tid].Rules {
+			it.v4Tables[tid].Rules[i].Target = transform(rule.Target)
+		}
+	}
+	for tid := range it.v6Tables {
+		for i, rule := range it.v6Tables[tid].Rules {
+			it.v6Tables[tid].Rules[i].Target = transform(rule.Target)
+		}
+	}
+}
+
+// A Table defines a set of chains and hooks into the network stack.
+//
+// It is a list of Rules, entry points (BuiltinChains), and error handlers
+// (Underflows). As packets traverse netstack, they hit hooks. When a packet
+// hits a hook, iptables compares it to Rules starting from that hook's entry
+// point. So if a packet hits the Input hook, we look up the corresponding
+// entry point in BuiltinChains and jump to that point.
+//
+// If the Rule doesn't match the packet, iptables continues to the next Rule.
+// If a Rule does match, it can issue a verdict on the packet (e.g. RuleAccept
+// or RuleDrop) that causes the packet to stop traversing iptables. It can also
+// jump to other rules or perform custom actions based on Rule.Target.
+//
+// Underflow Rules are invoked when a chain returns without reaching a verdict.
+//
+// +stateify savable
 type Table struct {
 	// Rules holds the rules that make up the table.
 	Rules []Rule
 
 	// BuiltinChains maps builtin chains to their entrypoint rule in Rules.
-	BuiltinChains map[Hook]int
+	BuiltinChains [NumHooks]int
 
 	// Underflows maps builtin chains to their underflow rule in Rules
 	// (i.e. the rule to execute if the chain returns without a verdict).
-	Underflows map[Hook]int
-
-	// UserChains holds user-defined chains for the keyed by name. Users
-	// can give their chains arbitrary names.
-	UserChains map[string]int
+	Underflows [NumHooks]int
 }
 
 // ValidHooks returns a bitmap of the builtin hooks for the given table.
 func (table *Table) ValidHooks() uint32 {
 	hooks := uint32(0)
-	for hook := range table.BuiltinChains {
-		hooks |= 1 << hook
+	for hook, ruleIdx := range table.BuiltinChains {
+		if ruleIdx != HookUnset {
+			hooks |= 1 << hook
+		}
 	}
 	return hooks
 }
@@ -130,6 +164,8 @@ func (table *Table) ValidHooks() uint32 {
 // contains zero or more matchers, each of which is a specification of which
 // packets this rule applies to. If there are no matchers in the rule, it
 // applies to any packet.
+//
+// +stateify savable
 type Rule struct {
 	// Filter holds basic IP filtering fields common to every rule.
 	Filter IPHeaderFilter
@@ -141,10 +177,16 @@ type Rule struct {
 	Target Target
 }
 
-// IPHeaderFilter holds basic IP filtering data common to every rule.
+// IPHeaderFilter performs basic IP header matching common to every rule.
+//
+// +stateify savable
 type IPHeaderFilter struct {
 	// Protocol matches the transport protocol.
 	Protocol tcpip.TransportProtocolNumber
+
+	// CheckProtocol determines whether the Protocol field should be
+	// checked during matching.
+	CheckProtocol bool
 
 	// Dst matches the destination IP address.
 	Dst tcpip.Address
@@ -168,8 +210,19 @@ type IPHeaderFilter struct {
 	// filter will match packets that fail the source comparison.
 	SrcInvert bool
 
-	// OutputInterface matches the name of the outgoing interface for the
-	// packet.
+	// InputInterface matches the name of the incoming interface for the packet.
+	InputInterface string
+
+	// InputInterfaceMask masks the characters of the interface name when
+	// comparing with InputInterface.
+	InputInterfaceMask string
+
+	// InputInterfaceInvert inverts the meaning of incoming interface check,
+	// i.e. when true the filter will match packets that fail the incoming
+	// interface comparison.
+	InputInterfaceInvert bool
+
+	// OutputInterface matches the name of the outgoing interface for the packet.
 	OutputInterface string
 
 	// OutputInterfaceMask masks the characters of the interface name when
@@ -182,48 +235,104 @@ type IPHeaderFilter struct {
 	OutputInterfaceInvert bool
 }
 
-// match returns whether hdr matches the filter.
-func (fl IPHeaderFilter) match(hdr header.IPv4, hook Hook, nicName string) bool {
-	// TODO(gvisor.dev/issue/170): Support other fields of the filter.
+// match returns whether pkt matches the filter.
+//
+// Preconditions: pkt.NetworkHeader is set and is at least of the minimal IPv4
+// or IPv6 header length.
+func (fl IPHeaderFilter) match(pkt PacketBufferPtr, hook Hook, inNicName, outNicName string) bool {
+	// Extract header fields.
+	var (
+		transProto tcpip.TransportProtocolNumber
+		dstAddr    tcpip.Address
+		srcAddr    tcpip.Address
+	)
+	switch proto := pkt.NetworkProtocolNumber; proto {
+	case header.IPv4ProtocolNumber:
+		hdr := header.IPv4(pkt.NetworkHeader().Slice())
+		transProto = hdr.TransportProtocol()
+		dstAddr = hdr.DestinationAddress()
+		srcAddr = hdr.SourceAddress()
+
+	case header.IPv6ProtocolNumber:
+		hdr := header.IPv6(pkt.NetworkHeader().Slice())
+		transProto = hdr.TransportProtocol()
+		dstAddr = hdr.DestinationAddress()
+		srcAddr = hdr.SourceAddress()
+
+	default:
+		panic(fmt.Sprintf("unknown network protocol with EtherType: %d", proto))
+	}
+
 	// Check the transport protocol.
-	if fl.Protocol != 0 && fl.Protocol != hdr.TransportProtocol() {
+	if fl.CheckProtocol && fl.Protocol != transProto {
 		return false
 	}
 
-	// Check the source and destination IPs.
-	if !filterAddress(hdr.DestinationAddress(), fl.DstMask, fl.Dst, fl.DstInvert) || !filterAddress(hdr.SourceAddress(), fl.SrcMask, fl.Src, fl.SrcInvert) {
+	// Check the addresses.
+	if !filterAddress(dstAddr, fl.DstMask, fl.Dst, fl.DstInvert) ||
+		!filterAddress(srcAddr, fl.SrcMask, fl.Src, fl.SrcInvert) {
 		return false
 	}
 
-	// Check the output interface.
-	// TODO(gvisor.dev/issue/170): Add the check for FORWARD and POSTROUTING
-	// hooks after supported.
-	if hook == Output {
-		n := len(fl.OutputInterface)
-		if n == 0 {
-			return true
+	switch hook {
+	case Prerouting, Input:
+		return matchIfName(inNicName, fl.InputInterface, fl.InputInterfaceInvert)
+	case Output:
+		return matchIfName(outNicName, fl.OutputInterface, fl.OutputInterfaceInvert)
+	case Forward:
+		if !matchIfName(inNicName, fl.InputInterface, fl.InputInterfaceInvert) {
+			return false
 		}
 
-		// If the interface name ends with '+', any interface which begins
-		// with the name should be matched.
-		ifName := fl.OutputInterface
-		matches := true
-		if strings.HasSuffix(ifName, "+") {
-			matches = strings.HasPrefix(nicName, ifName[:n-1])
-		} else {
-			matches = nicName == ifName
+		if !matchIfName(outNicName, fl.OutputInterface, fl.OutputInterfaceInvert) {
+			return false
 		}
-		return fl.OutputInterfaceInvert != matches
+
+		return true
+	case Postrouting:
+		return true
+	default:
+		panic(fmt.Sprintf("unknown hook: %d", hook))
 	}
+}
 
-	return true
+func matchIfName(nicName string, ifName string, invert bool) bool {
+	n := len(ifName)
+	if n == 0 {
+		// If the interface name is omitted in the filter, any interface will match.
+		return true
+	}
+	// If the interface name ends with '+', any interface which begins with the
+	// name should be matched.
+	var matches bool
+	if strings.HasSuffix(ifName, "+") {
+		matches = strings.HasPrefix(nicName, ifName[:n-1])
+	} else {
+		matches = nicName == ifName
+	}
+	return matches != invert
+}
+
+// NetworkProtocol returns the protocol (IPv4 or IPv6) on to which the header
+// applies.
+func (fl IPHeaderFilter) NetworkProtocol() tcpip.NetworkProtocolNumber {
+	switch fl.Src.BitLen() {
+	case header.IPv4AddressSizeBits:
+		return header.IPv4ProtocolNumber
+	case header.IPv6AddressSizeBits:
+		return header.IPv6ProtocolNumber
+	}
+	panic(fmt.Sprintf("invalid address in IPHeaderFilter: %s", fl.Src))
 }
 
 // filterAddress returns whether addr matches the filter.
 func filterAddress(addr, mask, filterAddr tcpip.Address, invert bool) bool {
 	matches := true
-	for i := range filterAddr {
-		if addr[i]&mask[i] != filterAddr[i] {
+	addrBytes := addr.AsSlice()
+	maskBytes := mask.AsSlice()
+	filterBytes := filterAddr.AsSlice()
+	for i := range filterAddr.AsSlice() {
+		if addrBytes[i]&maskBytes[i] != filterBytes[i] {
 			matches = false
 			break
 		}
@@ -233,15 +342,12 @@ func filterAddress(addr, mask, filterAddr tcpip.Address, invert bool) bool {
 
 // A Matcher is the interface for matching packets.
 type Matcher interface {
-	// Name returns the name of the Matcher.
-	Name() string
-
 	// Match returns whether the packet matches and whether the packet
 	// should be "hotdropped", i.e. dropped immediately. This is usually
 	// used for suspicious packets.
 	//
 	// Precondition: packet.NetworkHeader is set.
-	Match(hook Hook, packet *PacketBuffer, interfaceName string) (matches bool, hotdrop bool)
+	Match(hook Hook, packet PacketBufferPtr, inputInterfaceName, outputInterfaceName string) (matches bool, hotdrop bool)
 }
 
 // A Target is the interface for taking an action for a packet.
@@ -249,5 +355,5 @@ type Target interface {
 	// Action takes an action on the packet and returns a verdict on how
 	// traversal should (or should not) continue. If the return value is
 	// Jump, it also returns the index of the rule to jump to.
-	Action(packet *PacketBuffer, connections *ConnTrack, hook Hook, gso *GSO, r *Route, address tcpip.Address) (RuleVerdict, int)
+	Action(PacketBufferPtr, Hook, *Route, AddressableEndpoint) (RuleVerdict, int)
 }

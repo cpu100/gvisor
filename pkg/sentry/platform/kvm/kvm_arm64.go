@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build arm64
 // +build arm64
 
 package kvm
 
 import (
+	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
 )
 
 type kvmOneReg struct {
@@ -47,10 +48,11 @@ type userRegs struct {
 }
 
 type exception struct {
-	sErrPending uint8
-	sErrHasEsr  uint8
-	pad         [6]uint8
-	sErrEsr     uint64
+	sErrPending    uint8
+	sErrHasEsr     uint8
+	extDabtPending uint8
+	pad            [5]uint8
+	sErrEsr        uint64
 }
 
 type kvmVcpuEvents struct {
@@ -60,8 +62,8 @@ type kvmVcpuEvents struct {
 
 // updateGlobalOnce does global initialization. It has to be called only once.
 func updateGlobalOnce(fd int) error {
-	physicalInit()
 	err := updateSystemValues(int(fd))
 	ring0.Init()
+	physicalInit()
 	return err
 }

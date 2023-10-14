@@ -16,14 +16,16 @@ package memdev
 
 import (
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 const fullDevMinor = 7
 
 // fullDevice implements vfs.Device for /dev/full.
+//
+// +stateify savable
 type fullDevice struct{}
 
 // Open implements vfs.Device.Open.
@@ -38,6 +40,8 @@ func (fullDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, op
 }
 
 // fullFD implements vfs.FileDescriptionImpl for /dev/full.
+//
+// +stateify savable
 type fullFD struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -46,7 +50,7 @@ type fullFD struct {
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
-func (fd *fullFD) Release() {
+func (fd *fullFD) Release(context.Context) {
 	// noop
 }
 
@@ -62,12 +66,12 @@ func (fd *fullFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.Rea
 
 // PWrite implements vfs.FileDescriptionImpl.PWrite.
 func (fd *fullFD) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
-	return 0, syserror.ENOSPC
+	return 0, linuxerr.ENOSPC
 }
 
 // Write implements vfs.FileDescriptionImpl.Write.
 func (fd *fullFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
-	return 0, syserror.ENOSPC
+	return 0, linuxerr.ENOSPC
 }
 
 // Seek implements vfs.FileDescriptionImpl.Seek.

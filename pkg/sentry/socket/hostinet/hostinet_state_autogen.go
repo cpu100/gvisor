@@ -6,44 +6,61 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *socketOpsCommon) StateTypeName() string {
-	return "pkg/sentry/socket/hostinet.socketOpsCommon"
+func (s *Socket) StateTypeName() string {
+	return "pkg/sentry/socket/hostinet.Socket"
 }
 
-func (x *socketOpsCommon) StateFields() []string {
+func (s *Socket) StateFields() []string {
 	return []string{
+		"vfsfd",
+		"FileDescriptionDefaultImpl",
+		"LockFD",
+		"DentryMetadataFileDescriptionImpl",
 		"SendReceiveTimeout",
 		"family",
 		"stype",
 		"protocol",
 		"queue",
 		"fd",
+		"recvClosed",
 	}
 }
 
-func (x *socketOpsCommon) beforeSave() {}
+func (s *Socket) beforeSave() {}
 
-func (x *socketOpsCommon) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.SendReceiveTimeout)
-	m.Save(1, &x.family)
-	m.Save(2, &x.stype)
-	m.Save(3, &x.protocol)
-	m.Save(4, &x.queue)
-	m.Save(5, &x.fd)
+// +checklocksignore
+func (s *Socket) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.vfsfd)
+	stateSinkObject.Save(1, &s.FileDescriptionDefaultImpl)
+	stateSinkObject.Save(2, &s.LockFD)
+	stateSinkObject.Save(3, &s.DentryMetadataFileDescriptionImpl)
+	stateSinkObject.Save(4, &s.SendReceiveTimeout)
+	stateSinkObject.Save(5, &s.family)
+	stateSinkObject.Save(6, &s.stype)
+	stateSinkObject.Save(7, &s.protocol)
+	stateSinkObject.Save(8, &s.queue)
+	stateSinkObject.Save(9, &s.fd)
+	stateSinkObject.Save(10, &s.recvClosed)
 }
 
-func (x *socketOpsCommon) afterLoad() {}
+func (s *Socket) afterLoad() {}
 
-func (x *socketOpsCommon) StateLoad(m state.Source) {
-	m.Load(0, &x.SendReceiveTimeout)
-	m.Load(1, &x.family)
-	m.Load(2, &x.stype)
-	m.Load(3, &x.protocol)
-	m.Load(4, &x.queue)
-	m.Load(5, &x.fd)
+// +checklocksignore
+func (s *Socket) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.vfsfd)
+	stateSourceObject.Load(1, &s.FileDescriptionDefaultImpl)
+	stateSourceObject.Load(2, &s.LockFD)
+	stateSourceObject.Load(3, &s.DentryMetadataFileDescriptionImpl)
+	stateSourceObject.Load(4, &s.SendReceiveTimeout)
+	stateSourceObject.Load(5, &s.family)
+	stateSourceObject.Load(6, &s.stype)
+	stateSourceObject.Load(7, &s.protocol)
+	stateSourceObject.Load(8, &s.queue)
+	stateSourceObject.Load(9, &s.fd)
+	stateSourceObject.Load(10, &s.recvClosed)
 }
 
 func init() {
-	state.Register((*socketOpsCommon)(nil))
+	state.Register((*Socket)(nil))
 }

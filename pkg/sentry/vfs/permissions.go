@@ -16,15 +16,18 @@ package vfs
 
 import (
 	"math"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // AccessTypes is a bitmask of Unix file permissions.
+//
+// +stateify savable
 type AccessTypes uint16
 
 // Bits in AccessTypes.
@@ -74,7 +77,7 @@ func GenericCheckPermissions(creds *auth.Credentials, ats AccessTypes, mode linu
 	// the caller's user namespace; compare
 	// kernel/capability.c:privileged_wrt_inode_uidgid().
 	if !kuid.In(creds.UserNamespace).Ok() || !kgid.In(creds.UserNamespace).Ok() {
-		return syserror.EACCES
+		return linuxerr.EACCES
 	}
 	// CAP_DAC_READ_SEARCH allows the caller to read and search arbitrary
 	// directories, and read arbitrary non-directory files.
@@ -91,7 +94,7 @@ func GenericCheckPermissions(creds *auth.Credentials, ats AccessTypes, mode linu
 			return nil
 		}
 	}
-	return syserror.EACCES
+	return linuxerr.EACCES
 }
 
 // MayLink determines whether creating a hard link to a file with the given
@@ -107,12 +110,12 @@ func MayLink(creds *auth.Credentials, mode linux.FileMode, kuid auth.KUID, kgid 
 
 	// Only regular files can be hard linked.
 	if mode.FileType() != linux.S_IFREG {
-		return syserror.EPERM
+		return linuxerr.EPERM
 	}
 
 	// Setuid files should not get pinned to the filesystem.
 	if mode&linux.S_ISUID != 0 {
-		return syserror.EPERM
+		return linuxerr.EPERM
 	}
 
 	// Executable setgid files should not get pinned to the filesystem, but we
@@ -120,7 +123,7 @@ func MayLink(creds *auth.Credentials, mode linux.FileMode, kuid auth.KUID, kgid 
 
 	// Hardlinking to unreadable or unwritable sources is dangerous.
 	if err := GenericCheckPermissions(creds, MayRead|MayWrite, mode, kuid, kgid); err != nil {
-		return syserror.EPERM
+		return linuxerr.EPERM
 	}
 	return nil
 }
@@ -129,14 +132,14 @@ func MayLink(creds *auth.Credentials, mode linux.FileMode, kuid auth.KUID, kgid 
 // with the given OpenOptions.Flags. Note that this is NOT the same thing as
 // the set of accesses permitted for the opened file:
 //
-// - O_TRUNC causes MayWrite to be set in the returned AccessTypes (since it
-// mutates the file), but does not permit writing to the open file description
-// thereafter.
+//   - O_TRUNC causes MayWrite to be set in the returned AccessTypes (since it
+//     mutates the file), but does not permit writing to the open file description
+//     thereafter.
 //
-// - "Linux reserves the special, nonstandard access mode 3 (binary 11) in
-// flags to mean: check for read and write permission on the file and return a
-// file descriptor that can't be used for reading or writing." - open(2). Thus
-// AccessTypesForOpenFlags returns MayRead|MayWrite in this case.
+//   - "Linux reserves the special, nonstandard access mode 3 (binary 11) in
+//     flags to mean: check for read and write permission on the file and return a
+//     file descriptor that can't be used for reading or writing." - open(2). Thus
+//     AccessTypesForOpenFlags returns MayRead|MayWrite in this case.
 //
 // Use May{Read,Write}FileWithOpenFlags() for these checks instead.
 func AccessTypesForOpenFlags(opts *OpenOptions) AccessTypes {
@@ -183,19 +186,20 @@ func MayWriteFileWithOpenFlags(flags uint32) bool {
 // CheckSetStat checks that creds has permission to change the metadata of a
 // file with the given permissions, UID, and GID as specified by stat, subject
 // to the rules of Linux's fs/attr.c:setattr_prepare().
-func CheckSetStat(ctx context.Context, creds *auth.Credentials, stat *linux.Statx, mode linux.FileMode, kuid auth.KUID, kgid auth.KGID) error {
+func CheckSetStat(ctx context.Context, creds *auth.Credentials, opts *SetStatOptions, mode linux.FileMode, kuid auth.KUID, kgid auth.KGID) error {
+	stat := &opts.Stat
 	if stat.Mask&linux.STATX_SIZE != 0 {
 		limit, err := CheckLimit(ctx, 0, int64(stat.Size))
 		if err != nil {
 			return err
 		}
 		if limit < int64(stat.Size) {
-			return syserror.ErrExceedsFileSizeLimit
+			return linuxerr.ErrExceedsFileSizeLimit
 		}
 	}
 	if stat.Mask&linux.STATX_MODE != 0 {
 		if !CanActAsOwner(creds, kuid) {
-			return syserror.EPERM
+			return linuxerr.EPERM
 		}
 		// TODO(b/30815691): "If the calling process is not privileged (Linux:
 		// does not have the CAP_FSETID capability), and the group of the file
@@ -206,13 +210,18 @@ func CheckSetStat(ctx context.Context, creds *auth.Credentials, stat *linux.Stat
 	if stat.Mask&linux.STATX_UID != 0 {
 		if !((creds.EffectiveKUID == kuid && auth.KUID(stat.UID) == kuid) ||
 			HasCapabilityOnFile(creds, linux.CAP_CHOWN, kuid, kgid)) {
-			return syserror.EPERM
+			return linuxerr.EPERM
 		}
 	}
 	if stat.Mask&linux.STATX_GID != 0 {
 		if !((creds.EffectiveKUID == kuid && creds.InGroup(auth.KGID(stat.GID))) ||
 			HasCapabilityOnFile(creds, linux.CAP_CHOWN, kuid, kgid)) {
-			return syserror.EPERM
+			return linuxerr.EPERM
+		}
+	}
+	if opts.NeedWritePerm && !creds.HasCapability(linux.CAP_DAC_OVERRIDE) {
+		if err := GenericCheckPermissions(creds, MayWrite, mode, kuid, kgid); err != nil {
+			return err
 		}
 	}
 	if stat.Mask&(linux.STATX_ATIME|linux.STATX_MTIME|linux.STATX_CTIME) != 0 {
@@ -220,7 +229,7 @@ func CheckSetStat(ctx context.Context, creds *auth.Credentials, stat *linux.Stat
 			if (stat.Mask&linux.STATX_ATIME != 0 && stat.Atime.Nsec != linux.UTIME_NOW) ||
 				(stat.Mask&linux.STATX_MTIME != 0 && stat.Mtime.Nsec != linux.UTIME_NOW) ||
 				(stat.Mask&linux.STATX_CTIME != 0 && stat.Ctime.Nsec != linux.UTIME_NOW) {
-				return syserror.EPERM
+				return linuxerr.EPERM
 			}
 			if err := GenericCheckPermissions(creds, MayWrite, mode, kuid, kgid); err != nil {
 				return err
@@ -228,6 +237,22 @@ func CheckSetStat(ctx context.Context, creds *auth.Credentials, stat *linux.Stat
 		}
 	}
 	return nil
+}
+
+// CheckDeleteSticky checks whether the sticky bit is set on a directory with
+// the given file mode, and if so, checks whether creds has permission to
+// remove a file owned by childKUID from a directory with the given mode.
+// CheckDeleteSticky is consistent with fs/linux.h:check_sticky().
+func CheckDeleteSticky(creds *auth.Credentials, parentMode linux.FileMode, parentKUID auth.KUID, childKUID auth.KUID, childKGID auth.KGID) error {
+	if parentMode&linux.ModeSticky == 0 {
+		return nil
+	}
+	if creds.EffectiveKUID == childKUID ||
+		creds.EffectiveKUID == parentKUID ||
+		HasCapabilityOnFile(creds, linux.CAP_FOWNER, childKUID, childKGID) {
+		return nil
+	}
+	return linuxerr.EPERM
 }
 
 // CanActAsOwner returns true if creds can act as the owner of a file with the
@@ -251,16 +276,75 @@ func HasCapabilityOnFile(creds *auth.Credentials, cp linux.Capability, kuid auth
 // operation must not proceed. Otherwise it returns the max length allowed to
 // without violating the limit.
 func CheckLimit(ctx context.Context, offset, size int64) (int64, error) {
-	fileSizeLimit := limits.FromContext(ctx).Get(limits.FileSize).Cur
+	fileSizeLimit := limits.FromContextOrDie(ctx).Get(limits.FileSize).Cur
 	if fileSizeLimit > math.MaxInt64 {
 		return size, nil
 	}
 	if offset >= int64(fileSizeLimit) {
-		return 0, syserror.ErrExceedsFileSizeLimit
+		return 0, linuxerr.ErrExceedsFileSizeLimit
 	}
 	remaining := int64(fileSizeLimit) - offset
 	if remaining < size {
 		return remaining, nil
 	}
 	return size, nil
+}
+
+// CheckXattrPermissions checks permissions for extended attribute access.
+// This is analogous to fs/xattr.c:xattr_permission(). Some key differences:
+//   - Does not check for read-only filesystem property.
+//   - Does not check inode immutability or append only mode. In both cases EPERM
+//     must be returned by filesystem implementations.
+//   - Does not do inode permission checks. Filesystem implementations should
+//     handle inode permission checks as they may differ across implementations.
+func CheckXattrPermissions(creds *auth.Credentials, ats AccessTypes, mode linux.FileMode, kuid auth.KUID, name string) error {
+	switch {
+	case strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX):
+		// The trusted.* namespace can only be accessed by privileged
+		// users.
+		if creds.HasCapability(linux.CAP_SYS_ADMIN) {
+			return nil
+		}
+		if ats.MayWrite() {
+			return linuxerr.EPERM
+		}
+		return linuxerr.ENODATA
+	case strings.HasPrefix(name, linux.XATTR_USER_PREFIX):
+		// In the user.* namespace, only regular files and directories can have
+		// extended attributes. For sticky directories, only the owner and
+		// privileged users can write attributes.
+		filetype := mode.FileType()
+		if filetype != linux.ModeRegular && filetype != linux.ModeDirectory {
+			if ats.MayWrite() {
+				return linuxerr.EPERM
+			}
+			return linuxerr.ENODATA
+		}
+		if filetype == linux.ModeDirectory && mode&linux.ModeSticky != 0 && ats.MayWrite() && !CanActAsOwner(creds, kuid) {
+			return linuxerr.EPERM
+		}
+	case strings.HasPrefix(name, linux.XATTR_SECURITY_PREFIX):
+		if ats.MayRead() {
+			return linuxerr.ENODATA
+		}
+		return linuxerr.EOPNOTSUPP
+	}
+	return nil
+}
+
+// ClearSUIDAndSGID clears the setuid and/or setgid bits after a chown or write.
+// Depending on the mode, neither bit, only the setuid bit, or both are cleared.
+func ClearSUIDAndSGID(mode uint32) uint32 {
+	// Directories don't have their bits changed.
+	if mode&linux.ModeDirectory == linux.ModeDirectory {
+		return mode
+	}
+
+	// Changing owners always disables the setuid bit. It disables
+	// the setgid bit when the file is executable.
+	mode &= ^uint32(linux.ModeSetUID)
+	if sgid := uint32(linux.ModeSetGID | linux.ModeGroupExec); mode&sgid == sgid {
+		mode &= ^uint32(linux.ModeSetGID)
+	}
+	return mode
 }

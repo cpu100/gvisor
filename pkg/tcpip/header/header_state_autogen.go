@@ -6,37 +6,82 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *SACKBlock) StateTypeName() string {
+func (t *TCPSynOptions) StateTypeName() string {
+	return "pkg/tcpip/header.TCPSynOptions"
+}
+
+func (t *TCPSynOptions) StateFields() []string {
+	return []string{
+		"MSS",
+		"WS",
+		"TS",
+		"TSVal",
+		"TSEcr",
+		"SACKPermitted",
+		"Flags",
+	}
+}
+
+func (t *TCPSynOptions) beforeSave() {}
+
+// +checklocksignore
+func (t *TCPSynOptions) StateSave(stateSinkObject state.Sink) {
+	t.beforeSave()
+	stateSinkObject.Save(0, &t.MSS)
+	stateSinkObject.Save(1, &t.WS)
+	stateSinkObject.Save(2, &t.TS)
+	stateSinkObject.Save(3, &t.TSVal)
+	stateSinkObject.Save(4, &t.TSEcr)
+	stateSinkObject.Save(5, &t.SACKPermitted)
+	stateSinkObject.Save(6, &t.Flags)
+}
+
+func (t *TCPSynOptions) afterLoad() {}
+
+// +checklocksignore
+func (t *TCPSynOptions) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &t.MSS)
+	stateSourceObject.Load(1, &t.WS)
+	stateSourceObject.Load(2, &t.TS)
+	stateSourceObject.Load(3, &t.TSVal)
+	stateSourceObject.Load(4, &t.TSEcr)
+	stateSourceObject.Load(5, &t.SACKPermitted)
+	stateSourceObject.Load(6, &t.Flags)
+}
+
+func (r *SACKBlock) StateTypeName() string {
 	return "pkg/tcpip/header.SACKBlock"
 }
 
-func (x *SACKBlock) StateFields() []string {
+func (r *SACKBlock) StateFields() []string {
 	return []string{
 		"Start",
 		"End",
 	}
 }
 
-func (x *SACKBlock) beforeSave() {}
+func (r *SACKBlock) beforeSave() {}
 
-func (x *SACKBlock) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.Start)
-	m.Save(1, &x.End)
+// +checklocksignore
+func (r *SACKBlock) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.Start)
+	stateSinkObject.Save(1, &r.End)
 }
 
-func (x *SACKBlock) afterLoad() {}
+func (r *SACKBlock) afterLoad() {}
 
-func (x *SACKBlock) StateLoad(m state.Source) {
-	m.Load(0, &x.Start)
-	m.Load(1, &x.End)
+// +checklocksignore
+func (r *SACKBlock) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.Start)
+	stateSourceObject.Load(1, &r.End)
 }
 
-func (x *TCPOptions) StateTypeName() string {
+func (t *TCPOptions) StateTypeName() string {
 	return "pkg/tcpip/header.TCPOptions"
 }
 
-func (x *TCPOptions) StateFields() []string {
+func (t *TCPOptions) StateFields() []string {
 	return []string{
 		"TS",
 		"TSVal",
@@ -45,26 +90,29 @@ func (x *TCPOptions) StateFields() []string {
 	}
 }
 
-func (x *TCPOptions) beforeSave() {}
+func (t *TCPOptions) beforeSave() {}
 
-func (x *TCPOptions) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.TS)
-	m.Save(1, &x.TSVal)
-	m.Save(2, &x.TSEcr)
-	m.Save(3, &x.SACKBlocks)
+// +checklocksignore
+func (t *TCPOptions) StateSave(stateSinkObject state.Sink) {
+	t.beforeSave()
+	stateSinkObject.Save(0, &t.TS)
+	stateSinkObject.Save(1, &t.TSVal)
+	stateSinkObject.Save(2, &t.TSEcr)
+	stateSinkObject.Save(3, &t.SACKBlocks)
 }
 
-func (x *TCPOptions) afterLoad() {}
+func (t *TCPOptions) afterLoad() {}
 
-func (x *TCPOptions) StateLoad(m state.Source) {
-	m.Load(0, &x.TS)
-	m.Load(1, &x.TSVal)
-	m.Load(2, &x.TSEcr)
-	m.Load(3, &x.SACKBlocks)
+// +checklocksignore
+func (t *TCPOptions) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &t.TS)
+	stateSourceObject.Load(1, &t.TSVal)
+	stateSourceObject.Load(2, &t.TSEcr)
+	stateSourceObject.Load(3, &t.SACKBlocks)
 }
 
 func init() {
+	state.Register((*TCPSynOptions)(nil))
 	state.Register((*SACKBlock)(nil))
 	state.Register((*TCPOptions)(nil))
 }

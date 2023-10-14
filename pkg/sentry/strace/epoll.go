@@ -21,12 +21,13 @@ import (
 	"gvisor.dev/gvisor/pkg/abi"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/usermem"
+
+	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
-func epollEvent(t *kernel.Task, eventAddr usermem.Addr) string {
+func epollEvent(t *kernel.Task, eventAddr hostarch.Addr) string {
 	var e linux.EpollEvent
-	if _, err := t.CopyIn(eventAddr, &e); err != nil {
+	if _, err := e.CopyIn(t, eventAddr); err != nil {
 		return fmt.Sprintf("%#x {error reading event: %v}", eventAddr, err)
 	}
 	var sb strings.Builder
@@ -35,13 +36,13 @@ func epollEvent(t *kernel.Task, eventAddr usermem.Addr) string {
 	return sb.String()
 }
 
-func epollEvents(t *kernel.Task, eventsAddr usermem.Addr, numEvents, maxBytes uint64) string {
+func epollEvents(t *kernel.Task, eventsAddr hostarch.Addr, numEvents, maxBytes uint64) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%#x {", eventsAddr)
 	addr := eventsAddr
 	for i := uint64(0); i < numEvents; i++ {
 		var e linux.EpollEvent
-		if _, err := t.CopyIn(addr, &e); err != nil {
+		if _, err := e.CopyIn(t, addr); err != nil {
 			fmt.Fprintf(&sb, "{error reading event at %#x: %v}", addr, err)
 			continue
 		}
@@ -50,10 +51,10 @@ func epollEvents(t *kernel.Task, eventsAddr usermem.Addr, numEvents, maxBytes ui
 			sb.WriteString("...")
 			break
 		}
-		if _, ok := addr.AddLength(uint64(linux.SizeOfEpollEvent)); !ok {
-			fmt.Fprintf(&sb, "{error reading event at %#x: EFAULT}", addr)
-			continue
-		}
+		// Allowing addr to overflow is consistent with Linux, and harmless; if
+		// this isn't the last iteration of the loop, the next call to CopyIn
+		// will just fail with EFAULT.
+		addr, _ = addr.AddLength(uint64(linux.SizeOfEpollEvent))
 	}
 	sb.WriteString("}")
 	return sb.String()
@@ -75,7 +76,7 @@ var epollEventEvents = abi.FlagSet{
 	{Flag: linux.EPOLLPRI, Name: "EPOLLPRI"},
 	{Flag: linux.EPOLLOUT, Name: "EPOLLOUT"},
 	{Flag: linux.EPOLLERR, Name: "EPOLLERR"},
-	{Flag: linux.EPOLLHUP, Name: "EPULLHUP"},
+	{Flag: linux.EPOLLHUP, Name: "EPOLLHUP"},
 	{Flag: linux.EPOLLRDNORM, Name: "EPOLLRDNORM"},
 	{Flag: linux.EPOLLRDBAND, Name: "EPOLLRDBAND"},
 	{Flag: linux.EPOLLWRNORM, Name: "EPOLLWRNORM"},

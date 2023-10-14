@@ -12,21 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build arm64
+// +build arm64
+
 package kvm
 
 import (
-	"syscall"
+	"golang.org/x/sys/unix"
 
 	"gvisor.dev/gvisor/pkg/seccomp"
 )
 
-// SyscallFilters returns syscalls made exclusively by the KVM platform.
-func (*KVM) SyscallFilters() seccomp.SyscallRules {
-	return seccomp.SyscallRules{
-		syscall.SYS_IOCTL:           {},
-		syscall.SYS_MMAP:            {},
-		syscall.SYS_RT_SIGSUSPEND:   {},
-		syscall.SYS_RT_SIGTIMEDWAIT: {},
-		0xffffffffffffffff:          {}, // KVM uses syscall -1 to transition to host.
-	}
+// archSyscallFilters returns arch-specific syscalls made exclusively by the
+// KVM platform.
+func (*KVM) archSyscallFilters() seccomp.SyscallRules {
+	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+		unix.SYS_IOCTL: seccomp.PerArg{
+			seccomp.AnyValue{},
+			seccomp.EqualTo(KVM_SET_VCPU_EVENTS),
+		},
+	})
 }

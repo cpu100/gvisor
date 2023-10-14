@@ -15,11 +15,15 @@
 package netstack
 
 import (
+	"fmt"
+	"time"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/syserr"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -35,28 +39,65 @@ type Stack struct {
 	Stack *stack.Stack `state:"manual"`
 }
 
+// Destroy implements inet.Stack.Destroy.
+func (s *Stack) Destroy() {
+	s.Stack.Close()
+	refs.CleanupSync.Add(1)
+	go func() {
+		s.Stack.Wait()
+		refs.CleanupSync.Done()
+	}()
+}
+
 // SupportsIPv6 implements Stack.SupportsIPv6.
 func (s *Stack) SupportsIPv6() bool {
 	return s.Stack.CheckNetworkProtocol(ipv6.ProtocolNumber)
+}
+
+// Converts Netstack's ARPHardwareType to equivalent linux constants.
+func toLinuxARPHardwareType(t header.ARPHardwareType) uint16 {
+	switch t {
+	case header.ARPHardwareNone:
+		return linux.ARPHRD_NONE
+	case header.ARPHardwareLoopback:
+		return linux.ARPHRD_LOOPBACK
+	case header.ARPHardwareEther:
+		return linux.ARPHRD_ETHER
+	default:
+		panic(fmt.Sprintf("unknown ARPHRD type: %d", t))
+	}
 }
 
 // Interfaces implements inet.Stack.Interfaces.
 func (s *Stack) Interfaces() map[int32]inet.Interface {
 	is := make(map[int32]inet.Interface)
 	for id, ni := range s.Stack.NICInfo() {
-		var devType uint16
-		if ni.Flags.Loopback {
-			devType = linux.ARPHRD_LOOPBACK
-		}
 		is[int32(id)] = inet.Interface{
 			Name:       ni.Name,
 			Addr:       []byte(ni.LinkAddress),
 			Flags:      uint32(nicStateFlagsToLinux(ni.Flags)),
-			DeviceType: devType,
+			DeviceType: toLinuxARPHardwareType(ni.ARPHardwareType),
 			MTU:        ni.MTU,
 		}
 	}
 	return is
+}
+
+// RemoveInterface implements inet.Stack.RemoveInterface.
+func (s *Stack) RemoveInterface(idx int32) error {
+	nic := tcpip.NICID(idx)
+
+	nicInfo, ok := s.Stack.NICInfo()[nic]
+	if !ok {
+		return syserr.ErrUnknownNICID.ToError()
+	}
+
+	// Don't allow removing the loopback interface.
+	if nicInfo.Flags.Loopback {
+		return syserr.ErrNotSupported.ToError()
+	}
+
+	return syserr.TranslateNetstackError(s.Stack.RemoveNIC(nic)).ToError()
 }
 
 // InterfaceAddrs implements inet.Stack.InterfaceAddrs.
@@ -76,10 +117,11 @@ func (s *Stack) InterfaceAddrs() map[int32][]inet.InterfaceAddr {
 				continue
 			}
 
+			addrCopy := a.AddressWithPrefix.Address
 			addrs = append(addrs, inet.InterfaceAddr{
 				Family:    family,
 				PrefixLen: uint8(a.AddressWithPrefix.PrefixLen),
-				Addr:      []byte(a.AddressWithPrefix.Address),
+				Addr:      addrCopy.AsSlice(),
 				// TODO(b/68878065): Other fields.
 			})
 		}
@@ -88,62 +130,107 @@ func (s *Stack) InterfaceAddrs() map[int32][]inet.InterfaceAddr {
 	return nicAddrs
 }
 
-// AddInterfaceAddr implements inet.Stack.AddInterfaceAddr.
-func (s *Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+// convertAddr converts an InterfaceAddr to a ProtocolAddress.
+func convertAddr(addr inet.InterfaceAddr) (tcpip.ProtocolAddress, error) {
 	var (
-		protocol tcpip.NetworkProtocolNumber
-		address  tcpip.Address
+		protocol        tcpip.NetworkProtocolNumber
+		address         tcpip.Address
+		protocolAddress tcpip.ProtocolAddress
 	)
 	switch addr.Family {
 	case linux.AF_INET:
-		if len(addr.Addr) < header.IPv4AddressSize {
-			return syserror.EINVAL
+		if len(addr.Addr) != header.IPv4AddressSize {
+			return protocolAddress, linuxerr.EINVAL
 		}
 		if addr.PrefixLen > header.IPv4AddressSize*8 {
-			return syserror.EINVAL
+			return protocolAddress, linuxerr.EINVAL
 		}
 		protocol = ipv4.ProtocolNumber
-		address = tcpip.Address(addr.Addr[:header.IPv4AddressSize])
-
+		address = tcpip.AddrFrom4Slice(addr.Addr)
 	case linux.AF_INET6:
-		if len(addr.Addr) < header.IPv6AddressSize {
-			return syserror.EINVAL
+		if len(addr.Addr) != header.IPv6AddressSize {
+			return protocolAddress, linuxerr.EINVAL
 		}
 		if addr.PrefixLen > header.IPv6AddressSize*8 {
-			return syserror.EINVAL
+			return protocolAddress, linuxerr.EINVAL
 		}
 		protocol = ipv6.ProtocolNumber
-		address = tcpip.Address(addr.Addr[:header.IPv6AddressSize])
-
+		address = tcpip.AddrFrom16Slice(addr.Addr)
 	default:
-		return syserror.ENOTSUP
+		return protocolAddress, linuxerr.ENOTSUP
 	}
 
-	protocolAddress := tcpip.ProtocolAddress{
+	protocolAddress = tcpip.ProtocolAddress{
 		Protocol: protocol,
 		AddressWithPrefix: tcpip.AddressWithPrefix{
 			Address:   address,
 			PrefixLen: int(addr.PrefixLen),
 		},
 	}
+	return protocolAddress, nil
+}
+
+// AddInterfaceAddr implements inet.Stack.AddInterfaceAddr.
+func (s *Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+	protocolAddress, err := convertAddr(addr)
+	if err != nil {
+		return err
+	}
 
 	// Attach address to interface.
-	if err := s.Stack.AddProtocolAddressWithOptions(tcpip.NICID(idx), protocolAddress, stack.CanBePrimaryEndpoint); err != nil {
+	nicID := tcpip.NICID(idx)
+	if err := s.Stack.AddProtocolAddress(nicID, protocolAddress, stack.AddressProperties{}); err != nil {
 		return syserr.TranslateNetstackError(err).ToError()
 	}
 
-	// Add route for local network.
-	s.Stack.AddRoute(tcpip.Route{
+	// Add route for local network if it doesn't exist already.
+	localRoute := tcpip.Route{
 		Destination: protocolAddress.AddressWithPrefix.Subnet(),
-		Gateway:     "", // No gateway for local network.
-		NIC:         tcpip.NICID(idx),
+		Gateway:     tcpip.Address{}, // No gateway for local network.
+		NIC:         nicID,
+	}
+
+	for _, rt := range s.Stack.GetRouteTable() {
+		if rt.Equal(localRoute) {
+			return nil
+		}
+	}
+
+	// Local route does not exist yet. Add it.
+	s.Stack.AddRoute(localRoute)
+
+	return nil
+}
+
+// RemoveInterfaceAddr implements inet.Stack.RemoveInterfaceAddr.
+func (s *Stack) RemoveInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+	protocolAddress, err := convertAddr(addr)
+	if err != nil {
+		return err
+	}
+
+	// Remove addresses matching the address and prefix.
+	nicID := tcpip.NICID(idx)
+	if err := s.Stack.RemoveAddress(nicID, protocolAddress.AddressWithPrefix.Address); err != nil {
+		return syserr.TranslateNetstackError(err).ToError()
+	}
+
+	// Remove the corresponding local network route if it exists.
+	localRoute := tcpip.Route{
+		Destination: protocolAddress.AddressWithPrefix.Subnet(),
+		Gateway:     tcpip.Address{}, // No gateway for local network.
+		NIC:         nicID,
+	}
+	s.Stack.RemoveRoutes(func(rt tcpip.Route) bool {
+		return rt.Equal(localRoute)
 	})
+
 	return nil
 }
 
 // TCPReceiveBufferSize implements inet.Stack.TCPReceiveBufferSize.
 func (s *Stack) TCPReceiveBufferSize() (inet.TCPBufferSize, error) {
-	var rs tcp.ReceiveBufferSizeOption
+	var rs tcpip.TCPReceiveBufferSizeRangeOption
 	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &rs)
 	return inet.TCPBufferSize{
 		Min:     rs.Min,
@@ -154,17 +241,17 @@ func (s *Stack) TCPReceiveBufferSize() (inet.TCPBufferSize, error) {
 
 // SetTCPReceiveBufferSize implements inet.Stack.SetTCPReceiveBufferSize.
 func (s *Stack) SetTCPReceiveBufferSize(size inet.TCPBufferSize) error {
-	rs := tcp.ReceiveBufferSizeOption{
+	rs := tcpip.TCPReceiveBufferSizeRangeOption{
 		Min:     size.Min,
 		Default: size.Default,
 		Max:     size.Max,
 	}
-	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, rs)).ToError()
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &rs)).ToError()
 }
 
 // TCPSendBufferSize implements inet.Stack.TCPSendBufferSize.
 func (s *Stack) TCPSendBufferSize() (inet.TCPBufferSize, error) {
-	var ss tcp.SendBufferSizeOption
+	var ss tcpip.TCPSendBufferSizeRangeOption
 	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &ss)
 	return inet.TCPBufferSize{
 		Min:     ss.Min,
@@ -175,28 +262,44 @@ func (s *Stack) TCPSendBufferSize() (inet.TCPBufferSize, error) {
 
 // SetTCPSendBufferSize implements inet.Stack.SetTCPSendBufferSize.
 func (s *Stack) SetTCPSendBufferSize(size inet.TCPBufferSize) error {
-	ss := tcp.SendBufferSizeOption{
+	ss := tcpip.TCPSendBufferSizeRangeOption{
 		Min:     size.Min,
 		Default: size.Default,
 		Max:     size.Max,
 	}
-	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, ss)).ToError()
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &ss)).ToError()
 }
 
 // TCPSACKEnabled implements inet.Stack.TCPSACKEnabled.
 func (s *Stack) TCPSACKEnabled() (bool, error) {
-	var sack tcp.SACKEnabled
+	var sack tcpip.TCPSACKEnabled
 	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &sack)
 	return bool(sack), syserr.TranslateNetstackError(err).ToError()
 }
 
 // SetTCPSACKEnabled implements inet.Stack.SetTCPSACKEnabled.
 func (s *Stack) SetTCPSACKEnabled(enabled bool) error {
-	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(enabled))).ToError()
+	opt := tcpip.TCPSACKEnabled(enabled)
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)).ToError()
+}
+
+// TCPRecovery implements inet.Stack.TCPRecovery.
+func (s *Stack) TCPRecovery() (inet.TCPLossRecovery, error) {
+	var recovery tcpip.TCPRecovery
+	if err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
+		return 0, syserr.TranslateNetstackError(err).ToError()
+	}
+	return inet.TCPLossRecovery(recovery), nil
+}
+
+// SetTCPRecovery implements inet.Stack.SetTCPRecovery.
+func (s *Stack) SetTCPRecovery(recovery inet.TCPLossRecovery) error {
+	opt := tcpip.TCPRecovery(recovery)
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)).ToError()
 }
 
 // Statistics implements inet.Stack.Statistics.
-func (s *Stack) Statistics(stat interface{}, arg string) error {
+func (s *Stack) Statistics(stat any, arg string) error {
 	switch stats := stat.(type) {
 	case *inet.StatDev:
 		for _, ni := range s.Stack.NICInfo() {
@@ -251,37 +354,37 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 			0,                               // Support Ip/FragCreates.
 		}
 	case *inet.StatSNMPICMP:
-		in := Metrics.ICMP.V4PacketsReceived.ICMPv4PacketStats
-		out := Metrics.ICMP.V4PacketsSent.ICMPv4PacketStats
+		in := Metrics.ICMP.V4.PacketsReceived.ICMPv4PacketStats
+		out := Metrics.ICMP.V4.PacketsSent.ICMPv4PacketStats
 		// TODO(gvisor.dev/issue/969) Support stubbed stats.
 		*stats = inet.StatSNMPICMP{
 			0, // Icmp/InMsgs.
-			Metrics.ICMP.V4PacketsSent.Dropped.Value(), // InErrors.
+			Metrics.ICMP.V4.PacketsSent.Dropped.Value(), // InErrors.
 			0,                         // Icmp/InCsumErrors.
 			in.DstUnreachable.Value(), // InDestUnreachs.
 			in.TimeExceeded.Value(),   // InTimeExcds.
 			in.ParamProblem.Value(),   // InParmProbs.
 			in.SrcQuench.Value(),      // InSrcQuenchs.
 			in.Redirect.Value(),       // InRedirects.
-			in.Echo.Value(),           // InEchos.
+			in.EchoRequest.Value(),    // InEchos.
 			in.EchoReply.Value(),      // InEchoReps.
 			in.Timestamp.Value(),      // InTimestamps.
 			in.TimestampReply.Value(), // InTimestampReps.
 			in.InfoRequest.Value(),    // InAddrMasks.
 			in.InfoReply.Value(),      // InAddrMaskReps.
 			0,                         // Icmp/OutMsgs.
-			Metrics.ICMP.V4PacketsReceived.Invalid.Value(), // OutErrors.
-			out.DstUnreachable.Value(),                     // OutDestUnreachs.
-			out.TimeExceeded.Value(),                       // OutTimeExcds.
-			out.ParamProblem.Value(),                       // OutParmProbs.
-			out.SrcQuench.Value(),                          // OutSrcQuenchs.
-			out.Redirect.Value(),                           // OutRedirects.
-			out.Echo.Value(),                               // OutEchos.
-			out.EchoReply.Value(),                          // OutEchoReps.
-			out.Timestamp.Value(),                          // OutTimestamps.
-			out.TimestampReply.Value(),                     // OutTimestampReps.
-			out.InfoRequest.Value(),                        // OutAddrMasks.
-			out.InfoReply.Value(),                          // OutAddrMaskReps.
+			Metrics.ICMP.V4.PacketsReceived.Invalid.Value(), // OutErrors.
+			out.DstUnreachable.Value(),                      // OutDestUnreachs.
+			out.TimeExceeded.Value(),                        // OutTimeExcds.
+			out.ParamProblem.Value(),                        // OutParmProbs.
+			out.SrcQuench.Value(),                           // OutSrcQuenchs.
+			out.Redirect.Value(),                            // OutRedirects.
+			out.EchoRequest.Value(),                         // OutEchos.
+			out.EchoReply.Value(),                           // OutEchoReps.
+			out.Timestamp.Value(),                           // OutTimestamps.
+			out.TimestampReply.Value(),                      // OutTimestampReps.
+			out.InfoRequest.Value(),                         // OutAddrMasks.
+			out.InfoReply.Value(),                           // OutAddrMaskReps.
 		}
 	case *inet.StatSNMPTCP:
 		tcp := Metrics.TCP
@@ -328,16 +431,17 @@ func (s *Stack) RouteTable() []inet.Route {
 
 	for _, rt := range s.Stack.GetRouteTable() {
 		var family uint8
-		switch len(rt.Destination.ID()) {
-		case header.IPv4AddressSize:
+		switch rt.Destination.ID().BitLen() {
+		case header.IPv4AddressSizeBits:
 			family = linux.AF_INET
-		case header.IPv6AddressSize:
+		case header.IPv6AddressSizeBits:
 			family = linux.AF_INET6
 		default:
 			log.Warningf("Unknown network protocol in route %+v", rt)
 			continue
 		}
 
+		dstAddr := rt.Destination.ID()
 		routeTable = append(routeTable, inet.Route{
 			Family: family,
 			DstLen: uint8(rt.Destination.Prefix()), // The CIDR prefix for the destination.
@@ -351,9 +455,9 @@ func (s *Stack) RouteTable() []inet.Route {
 			Scope: linux.RT_SCOPE_LINK,
 			Type:  linux.RTN_UNICAST,
 
-			DstAddr:         []byte(rt.Destination.ID()),
+			DstAddr:         dstAddr.AsSlice(),
 			OutputInterface: int32(rt.NIC),
-			GatewayAddr:     []byte(rt.Gateway),
+			GatewayAddr:     rt.Gateway.AsSlice(),
 		})
 	}
 
@@ -363,6 +467,11 @@ func (s *Stack) RouteTable() []inet.Route {
 // IPTables returns the stack's iptables.
 func (s *Stack) IPTables() (*stack.IPTables, error) {
 	return s.Stack.IPTables(), nil
+}
+
+// Pause implements inet.Stack.Pause.
+func (s *Stack) Pause() {
+	s.Stack.Pause()
 }
 
 // Resume implements inet.Stack.Resume.
@@ -383,4 +492,33 @@ func (s *Stack) CleanupEndpoints() []stack.TransportEndpoint {
 // RestoreCleanupEndpoints implements inet.Stack.RestoreCleanupEndpoints.
 func (s *Stack) RestoreCleanupEndpoints(es []stack.TransportEndpoint) {
 	s.Stack.RestoreCleanupEndpoints(es)
+}
+
+// SetForwarding implements inet.Stack.SetForwarding.
+func (s *Stack) SetForwarding(protocol tcpip.NetworkProtocolNumber, enable bool) error {
+	if err := s.Stack.SetForwardingDefaultAndAllNICs(protocol, enable); err != nil {
+		return fmt.Errorf("SetForwardingDefaultAndAllNICs(%d, %t): %s", protocol, enable, err)
+	}
+	return nil
+}
+
+// PortRange implements inet.Stack.PortRange.
+func (s *Stack) PortRange() (uint16, uint16) {
+	return s.Stack.PortRange()
+}
+
+// SetPortRange implements inet.Stack.SetPortRange.
+func (s *Stack) SetPortRange(start uint16, end uint16) error {
+	return syserr.TranslateNetstackError(s.Stack.SetPortRange(start, end)).ToError()
+}
+
+// GROTimeout implements inet.Stack.GROTimeout.
+func (s *Stack) GROTimeout(nicID int32) (time.Duration, error) {
+	timeout, err := s.Stack.GROTimeout(tcpip.NICID(nicID))
+	return timeout, syserr.TranslateNetstackError(err).ToError()
+}
+
+// SetGROTimeout implements inet.Stack.SetGROTimeout.
+func (s *Stack) SetGROTimeout(nicID int32, timeout time.Duration) error {
+	return syserr.TranslateNetstackError(s.Stack.SetGROTimeout(tcpip.NICID(nicID), timeout)).ToError()
 }

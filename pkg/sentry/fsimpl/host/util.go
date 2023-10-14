@@ -15,21 +15,19 @@
 package host
 
 import (
-	"syscall"
-
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 )
 
-func toTimespec(ts linux.StatxTimestamp, omit bool) syscall.Timespec {
+func toTimespec(ts linux.StatxTimestamp, omit bool) unix.Timespec {
 	if omit {
-		return syscall.Timespec{
+		return unix.Timespec{
 			Sec:  0,
 			Nsec: unix.UTIME_OMIT,
 		}
 	}
-	return syscall.Timespec{
+	return unix.Timespec{
 		Sec:  ts.Sec,
 		Nsec: int64(ts.Nsec),
 	}
@@ -43,14 +41,8 @@ func timespecToStatxTimestamp(ts unix.Timespec) linux.StatxTimestamp {
 	return linux.StatxTimestamp{Sec: int64(ts.Sec), Nsec: uint32(ts.Nsec)}
 }
 
-// wouldBlock returns true for file types that can return EWOULDBLOCK
-// for blocking operations, e.g. pipes, character devices, and sockets.
-func wouldBlock(fileType uint32) bool {
-	return fileType == syscall.S_IFIFO || fileType == syscall.S_IFCHR || fileType == syscall.S_IFSOCK
-}
-
 // isBlockError checks if an error is EAGAIN or EWOULDBLOCK.
-// If so, they can be transformed into syserror.ErrWouldBlock.
+// If so, they can be transformed into linuxerr.ErrWouldBlock.
 func isBlockError(err error) bool {
-	return err == syserror.EAGAIN || err == syserror.EWOULDBLOCK
+	return linuxerr.Equals(linuxerr.EAGAIN, err) || linuxerr.Equals(linuxerr.EWOULDBLOCK, err)
 }

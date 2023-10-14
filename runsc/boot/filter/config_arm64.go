@@ -12,10 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build arm64
 // +build arm64
 
 package filter
 
-// Reserve for future customization.
+import (
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/seccomp"
+)
+
 func init() {
+	allowedSyscalls.Set(unix.SYS_CLONE, seccomp.PerArg{
+		seccomp.EqualTo(
+			unix.CLONE_VM |
+				unix.CLONE_FS |
+				unix.CLONE_FILES |
+				unix.CLONE_SIGHAND |
+				unix.CLONE_SYSVSEM |
+				unix.CLONE_THREAD),
+		seccomp.AnyValue{}, // newsp
+		// These arguments are left uninitialized by the Go
+		// runtime, so they may be anything (and are unused by
+		// the host).
+		seccomp.AnyValue{}, // parent_tidptr
+		seccomp.AnyValue{}, // tls
+		seccomp.AnyValue{}, // child_tidptr
+	})
+}
+
+func archFstatAtSysNo() uintptr {
+	return unix.SYS_FSTATAT
 }

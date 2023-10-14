@@ -16,15 +16,20 @@
 package tundev
 
 import (
+	"io"
+
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devtmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/tcpip/link/tun"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -36,6 +41,8 @@ const (
 )
 
 // tunDevice implements vfs.Device for /dev/net/tun.
+//
+// +stateify savable
 type tunDevice struct{}
 
 // Open implements vfs.Device.Open.
@@ -50,6 +57,8 @@ func (tunDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opt
 }
 
 // tunFD implements vfs.FileDescriptionImpl for /dev/net/tun.
+//
+// +stateify savable
 type tunFD struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -60,56 +69,52 @@ type tunFD struct {
 }
 
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
-func (fd *tunFD) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func (fd *tunFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	request := args[1].Uint()
 	data := args[2].Pointer()
 
+	t := kernel.TaskFromContext(ctx)
+	if t == nil {
+		panic("Ioctl should be called from a task context")
+	}
+
 	switch request {
 	case linux.TUNSETIFF:
-		t := kernel.TaskFromContext(ctx)
-		if t == nil {
-			panic("Ioctl should be called from a task context")
-		}
 		if !t.HasCapability(linux.CAP_NET_ADMIN) {
-			return 0, syserror.EPERM
+			return 0, linuxerr.EPERM
 		}
 		stack, ok := t.NetworkContext().(*netstack.Stack)
 		if !ok {
-			return 0, syserror.EINVAL
+			return 0, linuxerr.EINVAL
 		}
 
 		var req linux.IFReq
-		if _, err := usermem.CopyObjectIn(ctx, uio, data, &req, usermem.IOOpts{
-			AddressSpaceActive: true,
-		}); err != nil {
+		if _, err := req.CopyIn(t, data); err != nil {
 			return 0, err
 		}
-		flags := usermem.ByteOrder.Uint16(req.Data[:])
+
+		// Validate flags.
+		flags, err := netstack.LinuxToTUNFlags(hostarch.ByteOrder.Uint16(req.Data[:]))
+		if err != nil {
+			return 0, err
+		}
 		return 0, fd.device.SetIff(stack.Stack, req.Name(), flags)
 
 	case linux.TUNGETIFF:
 		var req linux.IFReq
-
 		copy(req.IFName[:], fd.device.Name())
-
-		// Linux adds IFF_NOFILTER (the same value as IFF_NO_PI unfortunately) when
-		// there is no sk_filter. See __tun_chr_ioctl() in net/drivers/tun.c.
-		flags := fd.device.Flags() | linux.IFF_NOFILTER
-		usermem.ByteOrder.PutUint16(req.Data[:], flags)
-
-		_, err := usermem.CopyObjectOut(ctx, uio, data, &req, usermem.IOOpts{
-			AddressSpaceActive: true,
-		})
+		hostarch.ByteOrder.PutUint16(req.Data[:], netstack.TUNFlagsToLinux(fd.device.Flags()))
+		_, err := req.CopyOut(t, data)
 		return 0, err
 
 	default:
-		return 0, syserror.ENOTTY
+		return 0, linuxerr.ENOTTY
 	}
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
-func (fd *tunFD) Release() {
-	fd.device.Release()
+func (fd *tunFD) Release(ctx context.Context) {
+	fd.device.Release(ctx)
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -123,8 +128,11 @@ func (fd *tunFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.Read
 	if err != nil {
 		return 0, err
 	}
-	n, err := dst.CopyOut(ctx, data)
-	if n > 0 && n < len(data) {
+	defer data.Release()
+
+	size := data.Size()
+	n, err := io.CopyN(dst.Writer(ctx), data, dst.NumBytes())
+	if n > 0 && n < int64(size) {
 		// Not an error for partial copying. Packet truncated.
 		err = nil
 	}
@@ -138,8 +146,19 @@ func (fd *tunFD) PWrite(ctx context.Context, src usermem.IOSequence, offset int6
 
 // Write implements vfs.FileDescriptionImpl.Write.
 func (fd *tunFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
-	data := make([]byte, src.NumBytes())
-	if _, err := src.CopyIn(ctx, data); err != nil {
+	if src.NumBytes() == 0 {
+		return 0, unix.EINVAL
+	}
+	mtu, err := fd.device.MTU()
+	if err != nil {
+		return 0, err
+	}
+	if int64(mtu) < src.NumBytes() {
+		return 0, unix.EMSGSIZE
+	}
+	data := buffer.NewView(int(src.NumBytes()))
+	defer data.Release()
+	if _, err := io.CopyN(data, src.Reader(ctx), src.NumBytes()); err != nil {
 		return 0, err
 	}
 	return fd.device.Write(data)
@@ -151,8 +170,9 @@ func (fd *tunFD) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // EventRegister implements watier.Waitable.EventRegister.
-func (fd *tunFD) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	fd.device.EventRegister(e, mask)
+func (fd *tunFD) EventRegister(e *waiter.Entry) error {
+	fd.device.EventRegister(e)
+	return nil
 }
 
 // EventUnregister implements watier.Waitable.EventUnregister.
@@ -160,8 +180,13 @@ func (fd *tunFD) EventUnregister(e *waiter.Entry) {
 	fd.device.EventUnregister(e)
 }
 
-// isNetTunSupported returns whether /dev/net/tun device is supported for s.
-func isNetTunSupported(s inet.Stack) bool {
+// Epollable implements FileDescriptionImpl.Epollable.
+func (fd *tunFD) Epollable() bool {
+	return true
+}
+
+// IsNetTunSupported returns whether /dev/net/tun device is supported for s.
+func IsNetTunSupported(s inet.Stack) bool {
 	_, ok := s.(*netstack.Stack)
 	return ok
 }

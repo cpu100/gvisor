@@ -15,7 +15,13 @@
 // Package inet defines semantics for IP stacks.
 package inet
 
-import "gvisor.dev/gvisor/pkg/tcpip/stack"
+import (
+	"time"
+
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+)
 
 // Stack represents a TCP/IP stack.
 type Stack interface {
@@ -24,13 +30,20 @@ type Stack interface {
 	// integers.
 	Interfaces() map[int32]Interface
 
+	// RemoveInterface removes the specified network interface.
+	RemoveInterface(idx int32) error
+
 	// InterfaceAddrs returns all network interface addresses as a mapping from
 	// interface indexes to a slice of associated interface address properties.
 	InterfaceAddrs() map[int32][]InterfaceAddr
 
 	// AddInterfaceAddr adds an address to the network interface identified by
-	// index.
+	// idx.
 	AddInterfaceAddr(idx int32, addr InterfaceAddr) error
+
+	// RemoveInterfaceAddr removes an address from the network interface
+	// identified by idx.
+	RemoveInterfaceAddr(idx int32, addr InterfaceAddr) error
 
 	// SupportsIPv6 returns true if the stack supports IPv6 connectivity.
 	SupportsIPv6() bool
@@ -56,14 +69,26 @@ type Stack interface {
 	// settings.
 	SetTCPSACKEnabled(enabled bool) error
 
+	// TCPRecovery returns the TCP loss detection algorithm.
+	TCPRecovery() (TCPLossRecovery, error)
+
+	// SetTCPRecovery attempts to change TCP loss detection algorithm.
+	SetTCPRecovery(recovery TCPLossRecovery) error
+
 	// Statistics reports stack statistics.
-	Statistics(stat interface{}, arg string) error
+	Statistics(stat any, arg string) error
 
 	// RouteTable returns the network stack's route table.
 	RouteTable() []Route
 
+	// Pause pauses the network stack before save.
+	Pause()
+
 	// Resume restarts the network stack after restore.
 	Resume()
+
+	// Destroy the network stack.
+	Destroy()
 
 	// RegisteredEndpoints returns all endpoints which are currently registered.
 	RegisteredEndpoints() []stack.TransportEndpoint
@@ -74,6 +99,23 @@ type Stack interface {
 	// RestoreCleanupEndpoints adds endpoints to cleanup tracking. This is useful
 	// for restoring a stack after a save.
 	RestoreCleanupEndpoints([]stack.TransportEndpoint)
+
+	// SetForwarding enables or disables packet forwarding between NICs.
+	SetForwarding(protocol tcpip.NetworkProtocolNumber, enable bool) error
+
+	// PortRange returns the UDP and TCP inclusive range of ephemeral ports
+	// used in both IPv4 and IPv6.
+	PortRange() (uint16, uint16)
+
+	// SetPortRange sets the UDP and TCP IPv4 and IPv6 ephemeral port range
+	// (inclusive).
+	SetPortRange(start uint16, end uint16) error
+
+	// GROTimeout returns the GRO timeout.
+	GROTimeout(NICID int32) (time.Duration, error)
+
+	// GROTimeout sets the GRO timeout.
+	SetGROTimeout(NICID int32, timeout time.Duration) error
 }
 
 // Interface contains information about a network interface.
@@ -93,6 +135,10 @@ type Interface struct {
 
 	// MTU is the maximum transmission unit.
 	MTU uint32
+
+	// Features are the device features queried from the host at
+	// stack creation time. These are immutable after startup.
+	Features []linux.EthtoolGetFeaturesBlock
 }
 
 // InterfaceAddr contains information about a network interface address.
@@ -189,3 +235,14 @@ type StatSNMPUDP [8]uint64
 
 // StatSNMPUDPLite describes UdpLite line of /proc/net/snmp.
 type StatSNMPUDPLite [8]uint64
+
+// TCPLossRecovery indicates TCP loss detection and recovery methods to use.
+type TCPLossRecovery int32
+
+// Loss recovery constants from include/net/tcp.h which are used to set
+// /proc/sys/net/ipv4/tcp_recovery.
+const (
+	TCP_RACK_LOSS_DETECTION TCPLossRecovery = 1 << iota
+	TCP_RACK_STATIC_REO_WND
+	TCP_RACK_NO_DUPTHRESH
+)

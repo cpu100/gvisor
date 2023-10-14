@@ -17,14 +17,14 @@ package tun
 import (
 	"fmt"
 
-	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/link/packetsocket"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -49,7 +49,14 @@ type Device struct {
 	mu           sync.RWMutex `state:"nosave"`
 	endpoint     *tunEndpoint
 	notifyHandle *channel.NotificationHandle
-	flags        uint16
+	flags        Flags
+}
+
+// Flags set properties of a Device
+type Flags struct {
+	TUN          bool
+	TAP          bool
+	NoPacketInfo bool
 }
 
 // beforeSave is invoked by stateify.
@@ -64,48 +71,46 @@ func (d *Device) beforeSave() {
 }
 
 // Release implements fs.FileOperations.Release.
-func (d *Device) Release() {
+func (d *Device) Release(ctx context.Context) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	// Decrease refcount if there is an endpoint associated with this file.
 	if d.endpoint != nil {
+		d.endpoint.Drain()
 		d.endpoint.RemoveNotify(d.notifyHandle)
-		d.endpoint.DecRef()
+		d.endpoint.DecRef(ctx)
 		d.endpoint = nil
 	}
 }
 
 // SetIff services TUNSETIFF ioctl(2) request.
-func (d *Device) SetIff(s *stack.Stack, name string, flags uint16) error {
+func (d *Device) SetIff(s *stack.Stack, name string, flags Flags) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	if d.endpoint != nil {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 
-	// Input validations.
-	isTun := flags&linux.IFF_TUN != 0
-	isTap := flags&linux.IFF_TAP != 0
-	supportedFlags := uint16(linux.IFF_TUN | linux.IFF_TAP | linux.IFF_NO_PI)
-	if isTap && isTun || !isTap && !isTun || flags&^supportedFlags != 0 {
-		return syserror.EINVAL
+	// Input validation.
+	if flags.TAP && flags.TUN || !flags.TAP && !flags.TUN {
+		return linuxerr.EINVAL
 	}
 
 	prefix := "tun"
-	if isTap {
+	if flags.TAP {
 		prefix = "tap"
 	}
 
 	linkCaps := stack.CapabilityNone
-	if isTap {
+	if flags.TAP {
 		linkCaps |= stack.CapabilityResolutionRequired
 	}
 
 	endpoint, err := attachOrCreateNIC(s, name, prefix, linkCaps)
 	if err != nil {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 
 	d.endpoint = endpoint
@@ -118,11 +123,11 @@ func attachOrCreateNIC(s *stack.Stack, name, prefix string, linkCaps stack.LinkE
 	for {
 		// 1. Try to attach to an existing NIC.
 		if name != "" {
-			if nic, found := s.GetNICByName(name); found {
-				endpoint, ok := nic.LinkEndpoint().(*tunEndpoint)
+			if linkEP := s.GetLinkEndpointByName(name); linkEP != nil {
+				endpoint, ok := linkEP.(*tunEndpoint)
 				if !ok {
 					// Not a NIC created by tun device.
-					return nil, syserror.EOPNOTSUPP
+					return nil, linuxerr.EOPNOTSUPP
 				}
 				if !endpoint.TryIncRef() {
 					// Race detected: NIC got deleted in between.
@@ -139,60 +144,82 @@ func attachOrCreateNIC(s *stack.Stack, name, prefix string, linkCaps stack.LinkE
 			stack:    s,
 			nicID:    id,
 			name:     name,
+			isTap:    prefix == "tap",
 		}
+		endpoint.InitRefs()
 		endpoint.Endpoint.LinkEPCapabilities = linkCaps
 		if endpoint.name == "" {
 			endpoint.name = fmt.Sprintf("%s%d", prefix, id)
 		}
-		err := s.CreateNICWithOptions(endpoint.nicID, endpoint, stack.NICOptions{
+		err := s.CreateNICWithOptions(endpoint.nicID, packetsocket.New(endpoint), stack.NICOptions{
 			Name: endpoint.name,
 		})
-		switch err {
+		switch err.(type) {
 		case nil:
 			return endpoint, nil
-		case tcpip.ErrDuplicateNICID:
+		case *tcpip.ErrDuplicateNICID:
 			// Race detected: A NIC has been created in between.
 			continue
 		default:
-			return nil, syserror.EINVAL
+			return nil, linuxerr.EINVAL
 		}
 	}
 }
 
-// Write inject one inbound packet to the network interface.
-func (d *Device) Write(data []byte) (int64, error) {
+// MTU returns the tun enpoint MTU (maximum transmission unit).
+func (d *Device) MTU() (uint32, error) {
 	d.mu.RLock()
 	endpoint := d.endpoint
 	d.mu.RUnlock()
 	if endpoint == nil {
-		return 0, syserror.EBADFD
+		return 0, linuxerr.EBADFD
 	}
 	if !endpoint.IsAttached() {
-		return 0, syserror.EIO
+		return 0, linuxerr.EIO
+	}
+	return endpoint.MTU(), nil
+}
+
+// Write inject one inbound packet to the network interface.
+func (d *Device) Write(data *buffer.View) (int64, error) {
+	d.mu.RLock()
+	endpoint := d.endpoint
+	d.mu.RUnlock()
+	if endpoint == nil {
+		return 0, linuxerr.EBADFD
+	}
+	if !endpoint.IsAttached() {
+		return 0, linuxerr.EIO
 	}
 
-	dataLen := int64(len(data))
+	dataLen := int64(data.Size())
 
 	// Packet information.
 	var pktInfoHdr PacketInfoHeader
-	if !d.hasFlags(linux.IFF_NO_PI) {
-		if len(data) < PacketInfoHeaderSize {
+	if !d.flags.NoPacketInfo {
+		if dataLen < PacketInfoHeaderSize {
 			// Ignore bad packet.
 			return dataLen, nil
 		}
-		pktInfoHdr = PacketInfoHeader(data[:PacketInfoHeaderSize])
-		data = data[PacketInfoHeaderSize:]
+		pktInfoHdrView := data.Clone()
+		defer pktInfoHdrView.Release()
+		pktInfoHdrView.CapLength(PacketInfoHeaderSize)
+		pktInfoHdr = PacketInfoHeader(pktInfoHdrView.AsSlice())
+		data.TrimFront(PacketInfoHeaderSize)
 	}
 
 	// Ethernet header (TAP only).
 	var ethHdr header.Ethernet
-	if d.hasFlags(linux.IFF_TAP) {
-		if len(data) < header.EthernetMinimumSize {
+	if d.flags.TAP {
+		if data.Size() < header.EthernetMinimumSize {
 			// Ignore bad packet.
 			return dataLen, nil
 		}
-		ethHdr = header.Ethernet(data[:header.EthernetMinimumSize])
-		data = data[header.EthernetMinimumSize:]
+		ethHdrView := data.Clone()
+		defer ethHdrView.Release()
+		ethHdrView.CapLength(header.EthernetMinimumSize)
+		ethHdr = header.Ethernet(ethHdrView.AsSlice())
+		data.TrimFront(header.EthernetMinimumSize)
 	}
 
 	// Try to determine network protocol number, default zero.
@@ -202,98 +229,65 @@ func (d *Device) Write(data []byte) (int64, error) {
 		protocol = pktInfoHdr.Protocol()
 	case ethHdr != nil:
 		protocol = ethHdr.Type()
+	case d.flags.TUN:
+		// TUN interface with IFF_NO_PI enabled, thus
+		// we need to determine protocol from version field
+		version := data.AsSlice()[0] >> 4
+		if version == 4 {
+			protocol = header.IPv4ProtocolNumber
+		} else if version == 6 {
+			protocol = header.IPv6ProtocolNumber
+		}
 	}
 
-	// Try to determine remote link address, default zero.
-	var remote tcpip.LinkAddress
-	switch {
-	case ethHdr != nil:
-		remote = ethHdr.SourceAddress()
-	default:
-		remote = tcpip.LinkAddress(zeroMAC[:])
-	}
-
-	pkt := &stack.PacketBuffer{
-		Data: buffer.View(data).ToVectorisedView(),
-	}
-	if ethHdr != nil {
-		pkt.LinkHeader = buffer.View(ethHdr)
-	}
-	endpoint.InjectLinkAddr(protocol, remote, pkt)
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: len(ethHdr),
+		Payload:            buffer.MakeWithView(data.Clone()),
+	})
+	defer pkt.DecRef()
+	copy(pkt.LinkHeader().Push(len(ethHdr)), ethHdr)
+	endpoint.InjectInbound(protocol, pkt)
 	return dataLen, nil
 }
 
 // Read reads one outgoing packet from the network interface.
-func (d *Device) Read() ([]byte, error) {
+func (d *Device) Read() (*buffer.View, error) {
 	d.mu.RLock()
 	endpoint := d.endpoint
 	d.mu.RUnlock()
 	if endpoint == nil {
-		return nil, syserror.EBADFD
+		return nil, linuxerr.EBADFD
 	}
 
-	for {
-		info, ok := endpoint.Read()
-		if !ok {
-			return nil, syserror.ErrWouldBlock
-		}
-
-		v, ok := d.encodePkt(&info)
-		if !ok {
-			// Ignore unsupported packet.
-			continue
-		}
-		return v, nil
+	pkt := endpoint.Read()
+	if pkt.IsNil() {
+		return nil, linuxerr.ErrWouldBlock
 	}
+	v := d.encodePkt(pkt)
+	pkt.DecRef()
+	return v, nil
 }
 
 // encodePkt encodes packet for fd side.
-func (d *Device) encodePkt(info *channel.PacketInfo) (buffer.View, bool) {
-	var vv buffer.VectorisedView
+func (d *Device) encodePkt(pkt stack.PacketBufferPtr) *buffer.View {
+	var view *buffer.View
 
 	// Packet information.
-	if !d.hasFlags(linux.IFF_NO_PI) {
-		hdr := make(PacketInfoHeader, PacketInfoHeaderSize)
+	if !d.flags.NoPacketInfo {
+		view = buffer.NewView(PacketInfoHeaderSize + pkt.Size())
+		view.Grow(PacketInfoHeaderSize)
+		hdr := PacketInfoHeader(view.AsSlice())
 		hdr.Encode(&PacketInfoFields{
-			Protocol: info.Proto,
+			Protocol: pkt.NetworkProtocolNumber,
 		})
-		vv.AppendView(buffer.View(hdr))
+		pktView := pkt.ToView()
+		view.Write(pktView.AsSlice())
+		pktView.Release()
+	} else {
+		view = pkt.ToView()
 	}
 
-	// If the packet does not already have link layer header, and the route
-	// does not exist, we can't compute it. This is possibly a raw packet, tun
-	// device doesn't support this at the moment.
-	if info.Pkt.LinkHeader == nil && info.Route.RemoteLinkAddress == "" {
-		return nil, false
-	}
-
-	// Ethernet header (TAP only).
-	if d.hasFlags(linux.IFF_TAP) {
-		// Add ethernet header if not provided.
-		if info.Pkt.LinkHeader == nil {
-			hdr := &header.EthernetFields{
-				SrcAddr: info.Route.LocalLinkAddress,
-				DstAddr: info.Route.RemoteLinkAddress,
-				Type:    info.Proto,
-			}
-			if hdr.SrcAddr == "" {
-				hdr.SrcAddr = d.endpoint.LinkAddress()
-			}
-
-			eth := make(header.Ethernet, header.EthernetMinimumSize)
-			eth.Encode(hdr)
-			vv.AppendView(buffer.View(eth))
-		} else {
-			vv.AppendView(info.Pkt.LinkHeader)
-		}
-	}
-
-	// Append upper headers.
-	vv.AppendView(buffer.View(info.Pkt.Header.View()[len(info.Pkt.LinkHeader):]))
-	// Append data payload.
-	vv.Append(info.Pkt.Data)
-
-	return vv.ToView(), true
+	return view
 }
 
 // Name returns the name of the attached network interface. Empty string if
@@ -308,32 +302,28 @@ func (d *Device) Name() string {
 }
 
 // Flags returns the flags set for d. Zero value if unset.
-func (d *Device) Flags() uint16 {
+func (d *Device) Flags() Flags {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.flags
 }
 
-func (d *Device) hasFlags(flags uint16) bool {
-	return d.flags&flags == flags
-}
-
 // Readiness implements watier.Waitable.Readiness.
 func (d *Device) Readiness(mask waiter.EventMask) waiter.EventMask {
-	if mask&waiter.EventIn != 0 {
+	if mask&waiter.ReadableEvents != 0 {
 		d.mu.RLock()
 		endpoint := d.endpoint
 		d.mu.RUnlock()
 		if endpoint != nil && endpoint.NumQueued() == 0 {
-			mask &= ^waiter.EventIn
+			mask &= ^waiter.ReadableEvents
 		}
 	}
-	return mask & (waiter.EventIn | waiter.EventOut)
+	return mask & (waiter.ReadableEvents | waiter.WritableEvents)
 }
 
 // WriteNotify implements channel.Notification.WriteNotify.
 func (d *Device) WriteNotify() {
-	d.Notify(waiter.EventIn)
+	d.Notify(waiter.ReadableEvents)
 }
 
 // tunEndpoint is the link endpoint for the NIC created by the tun device.
@@ -341,18 +331,48 @@ func (d *Device) WriteNotify() {
 // It is ref-counted as multiple opening files can attach to the same NIC.
 // The last owner is responsible for deleting the NIC.
 type tunEndpoint struct {
+	tunEndpointRefs
 	*channel.Endpoint
-
-	refs.AtomicRefCount
 
 	stack *stack.Stack
 	nicID tcpip.NICID
 	name  string
+	isTap bool
 }
 
-// DecRef decrements refcount of e, removes NIC if refcount goes to 0.
-func (e *tunEndpoint) DecRef() {
-	e.DecRefWithDestructor(func() {
+// DecRef decrements refcount of e, removing NIC if it reaches 0.
+func (e *tunEndpoint) DecRef(ctx context.Context) {
+	e.tunEndpointRefs.DecRef(func() {
+		e.Close()
 		e.stack.RemoveNIC(e.nicID)
 	})
+}
+
+// ARPHardwareType implements stack.LinkEndpoint.ARPHardwareType.
+func (e *tunEndpoint) ARPHardwareType() header.ARPHardwareType {
+	if e.isTap {
+		return header.ARPHardwareEther
+	}
+	return header.ARPHardwareNone
+}
+
+// AddHeader implements stack.LinkEndpoint.AddHeader.
+func (e *tunEndpoint) AddHeader(pkt stack.PacketBufferPtr) {
+	if !e.isTap {
+		return
+	}
+	eth := header.Ethernet(pkt.LinkHeader().Push(header.EthernetMinimumSize))
+	eth.Encode(&header.EthernetFields{
+		SrcAddr: pkt.EgressRoute.LocalLinkAddress,
+		DstAddr: pkt.EgressRoute.RemoteLinkAddress,
+		Type:    pkt.NetworkProtocolNumber,
+	})
+}
+
+// MaxHeaderLength returns the maximum size of the link layer header.
+func (e *tunEndpoint) MaxHeaderLength() uint16 {
+	if e.isTap {
+		return header.EthernetMinimumSize
+	}
+	return 0
 }

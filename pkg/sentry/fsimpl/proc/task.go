@@ -20,23 +20,27 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // taskInode represents the inode for /proc/PID/ directory.
 //
 // +stateify savable
 type taskInode struct {
-	kernfs.InodeNotSymlink
-	kernfs.InodeDirectoryNoNewChildren
-	kernfs.InodeNoDynamicLookup
+	implStatFS
 	kernfs.InodeAttrs
+	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotAnonymous
+	kernfs.InodeNotSymlink
+	kernfs.InodeTemporary
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
+	taskInodeRefs
 
 	locks vfs.FileLocks
 
@@ -45,80 +49,102 @@ type taskInode struct {
 
 var _ kernfs.Inode = (*taskInode)(nil)
 
-func (fs *filesystem) newTaskInode(task *kernel.Task, pidns *kernel.PIDNamespace, isThreadGroup bool, cgroupControllers map[string]string) *kernfs.Dentry {
-	// TODO(gvisor.dev/issue/164): Fail with ESRCH if task exited.
-	contents := map[string]*kernfs.Dentry{
-		"auxv":      fs.newTaskOwnedFile(task, fs.NextIno(), 0444, &auxvData{task: task}),
-		"cmdline":   fs.newTaskOwnedFile(task, fs.NextIno(), 0444, &cmdlineData{task: task, arg: cmdlineDataArg}),
-		"comm":      fs.newComm(task, fs.NextIno(), 0444),
-		"environ":   fs.newTaskOwnedFile(task, fs.NextIno(), 0444, &cmdlineData{task: task, arg: environDataArg}),
-		"exe":       fs.newExeSymlink(task, fs.NextIno()),
-		"fd":        fs.newFDDirInode(task),
-		"fdinfo":    fs.newFDInfoDirInode(task),
-		"gid_map":   fs.newTaskOwnedFile(task, fs.NextIno(), 0644, &idMapData{task: task, gids: true}),
-		"io":        fs.newTaskOwnedFile(task, fs.NextIno(), 0400, newIO(task, isThreadGroup)),
-		"maps":      fs.newTaskOwnedFile(task, fs.NextIno(), 0444, &mapsData{task: task}),
-		"mountinfo": fs.newTaskOwnedFile(task, fs.NextIno(), 0444, &mountInfoData{task: task}),
-		"mounts":    fs.newTaskOwnedFile(task, fs.NextIno(), 0444, &mountsData{task: task}),
-		"net":       fs.newTaskNetDir(task),
-		"ns": fs.newTaskOwnedDir(task, fs.NextIno(), 0511, map[string]*kernfs.Dentry{
-			"net":  fs.newNamespaceSymlink(task, fs.NextIno(), "net"),
-			"pid":  fs.newNamespaceSymlink(task, fs.NextIno(), "pid"),
-			"user": fs.newNamespaceSymlink(task, fs.NextIno(), "user"),
+func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns *kernel.PIDNamespace, isThreadGroup bool, fakeCgroupControllers map[string]string) (kernfs.Inode, error) {
+	if task.ExitState() == kernel.TaskExitDead {
+		return nil, linuxerr.ESRCH
+	}
+
+	contents := map[string]kernfs.Inode{
+		"auxv":      fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &auxvData{task: task}),
+		"cmdline":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &metadataData{task: task, metaType: Cmdline}),
+		"comm":      fs.newComm(ctx, task, fs.NextIno(), 0644),
+		"cwd":       fs.newCwdSymlink(ctx, task, fs.NextIno()),
+		"environ":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &metadataData{task: task, metaType: Environ}),
+		"exe":       fs.newExeSymlink(ctx, task, fs.NextIno()),
+		"fd":        fs.newFDDirInode(ctx, task),
+		"fdinfo":    fs.newFDInfoDirInode(ctx, task),
+		"gid_map":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &idMapData{task: task, gids: true}),
+		"io":        fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0400, newIO(task, isThreadGroup)),
+		"limits":    fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &limitsData{task: task}),
+		"maps":      fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mapsData{task: task}),
+		"mem":       fs.newMemInode(ctx, task, fs.NextIno(), 0400),
+		"mountinfo": fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mountInfoData{fs: fs, task: task}),
+		"mounts":    fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mountsData{fs: fs, task: task}),
+		"net":       fs.newTaskNetDir(ctx, task),
+		"ns": fs.newTaskOwnedDir(ctx, task, fs.NextIno(), 0511, map[string]kernfs.Inode{
+			"net":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWNET),
+			"mnt":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWNS),
+			"pid":  fs.newPIDNamespaceSymlink(ctx, task, fs.NextIno()),
+			"user": fs.newFakeNamespaceSymlink(ctx, task, fs.NextIno(), "user"),
+			"ipc":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWIPC),
+			"uts":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWUTS),
 		}),
-		"oom_score":     fs.newTaskOwnedFile(task, fs.NextIno(), 0444, newStaticFile("0\n")),
-		"oom_score_adj": fs.newTaskOwnedFile(task, fs.NextIno(), 0644, &oomScoreAdj{task: task}),
-		"smaps":         fs.newTaskOwnedFile(task, fs.NextIno(), 0444, &smapsData{task: task}),
-		"stat":          fs.newTaskOwnedFile(task, fs.NextIno(), 0444, &taskStatData{task: task, pidns: pidns, tgstats: isThreadGroup}),
-		"statm":         fs.newTaskOwnedFile(task, fs.NextIno(), 0444, &statmData{task: task}),
-		"status":        fs.newTaskOwnedFile(task, fs.NextIno(), 0444, &statusData{task: task, pidns: pidns}),
-		"uid_map":       fs.newTaskOwnedFile(task, fs.NextIno(), 0644, &idMapData{task: task, gids: false}),
+		"oom_score":     fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, newStaticFile("0\n")),
+		"oom_score_adj": fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &oomScoreAdj{task: task}),
+		"root":          fs.newRootSymlink(ctx, task, fs.NextIno()),
+		"smaps":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &smapsData{task: task}),
+		"stat":          fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &taskStatData{task: task, pidns: pidns, tgstats: isThreadGroup}),
+		"statm":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &statmData{task: task}),
+		"status":        fs.newStatusInode(ctx, task, pidns, fs.NextIno(), 0444),
+		"uid_map":       fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &idMapData{task: task, gids: false}),
 	}
 	if isThreadGroup {
-		contents["task"] = fs.newSubtasks(task, pidns, cgroupControllers)
+		contents["task"] = fs.newSubtasks(ctx, task, pidns, fakeCgroupControllers)
+	} else {
+		contents["children"] = fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &childrenData{task: task, pidns: pidns})
 	}
-	if len(cgroupControllers) > 0 {
-		contents["cgroup"] = fs.newTaskOwnedFile(task, fs.NextIno(), 0444, newCgroupData(cgroupControllers))
+	if len(fakeCgroupControllers) > 0 {
+		contents["cgroup"] = fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, newFakeCgroupData(fakeCgroupControllers))
+	} else {
+		contents["cgroup"] = fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &taskCgroupData{task: task})
 	}
 
 	taskInode := &taskInode{task: task}
 	// Note: credentials are overridden by taskOwnedInode.
-	taskInode.InodeAttrs.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
+	taskInode.InodeAttrs.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
+	taskInode.InitRefs()
 
 	inode := &taskOwnedInode{Inode: taskInode, owner: task}
-	dentry := &kernfs.Dentry{}
-	dentry.Init(inode)
 
 	taskInode.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
-	links := taskInode.OrderedChildren.Populate(dentry, contents)
+	links := taskInode.OrderedChildren.Populate(contents)
 	taskInode.IncLinks(links)
 
-	return dentry
+	return inode, nil
 }
 
-// Valid implements kernfs.inodeDynamicLookup. This inode remains valid as long
+// Valid implements kernfs.Inode.Valid. This inode remains valid as long
 // as the task is still running. When it's dead, another tasks with the same
 // PID could replace it.
 func (i *taskInode) Valid(ctx context.Context) bool {
 	return i.task.ExitState() != kernel.TaskExitDead
 }
 
-// Open implements kernfs.Inode.
-func (i *taskInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &i.OrderedChildren, &i.locks, &opts)
+// Open implements kernfs.Inode.Open.
+func (i *taskInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), d, &i.OrderedChildren, &i.locks, &opts, kernfs.GenericDirectoryFDOptions{
+		SeekEnd: kernfs.SeekEndZero,
+	})
 	if err != nil {
 		return nil, err
 	}
 	return fd.VFSFileDescription(), nil
 }
 
-// SetStat implements Inode.SetStat not allowing inode attributes to be changed.
+// SetStat implements kernfs.Inode.SetStat not allowing inode attributes to be changed.
 func (*taskInode) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
-	return syserror.EPERM
+	return linuxerr.EPERM
+}
+
+// DecRef implements kernfs.Inode.DecRef.
+func (i *taskInode) DecRef(ctx context.Context) {
+	i.taskInodeRefs.DecRef(func() { i.Destroy(ctx) })
 }
 
 // taskOwnedInode implements kernfs.Inode and overrides inode owner with task
 // effective user and group.
+//
+// +stateify savable
 type taskOwnedInode struct {
 	kernfs.Inode
 
@@ -128,36 +154,28 @@ type taskOwnedInode struct {
 
 var _ kernfs.Inode = (*taskOwnedInode)(nil)
 
-func (fs *filesystem) newTaskOwnedFile(task *kernel.Task, ino uint64, perm linux.FileMode, inode dynamicInode) *kernfs.Dentry {
+func (fs *filesystem) newTaskOwnedInode(ctx context.Context, task *kernel.Task, ino uint64, perm linux.FileMode, inode dynamicInode) kernfs.Inode {
 	// Note: credentials are overridden by taskOwnedInode.
-	inode.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, inode, perm)
+	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, inode, perm)
 
-	taskInode := &taskOwnedInode{Inode: inode, owner: task}
-	d := &kernfs.Dentry{}
-	d.Init(taskInode)
-	return d
+	return &taskOwnedInode{Inode: inode, owner: task}
 }
 
-func (fs *filesystem) newTaskOwnedDir(task *kernel.Task, ino uint64, perm linux.FileMode, children map[string]*kernfs.Dentry) *kernfs.Dentry {
-	dir := &kernfs.StaticDirectory{}
-
+func (fs *filesystem) newTaskOwnedDir(ctx context.Context, task *kernel.Task, ino uint64, perm linux.FileMode, children map[string]kernfs.Inode) kernfs.Inode {
 	// Note: credentials are overridden by taskOwnedInode.
-	dir.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, perm)
+	fdOpts := kernfs.GenericDirectoryFDOptions{SeekEnd: kernfs.SeekEndZero}
+	dir := kernfs.NewStaticDir(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, perm, children, fdOpts)
 
-	inode := &taskOwnedInode{Inode: dir, owner: task}
-	d := &kernfs.Dentry{}
-	d.Init(inode)
-
-	dir.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
-	links := dir.OrderedChildren.Populate(d, children)
-	dir.IncLinks(links)
-
-	return d
+	return &taskOwnedInode{Inode: dir, owner: task}
 }
 
-// Stat implements kernfs.Inode.
-func (i *taskOwnedInode) Stat(fs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
-	stat, err := i.Inode.Stat(fs, opts)
+func (i *taskOwnedInode) Valid(ctx context.Context) bool {
+	return i.owner.ExitState() != kernel.TaskExitDead && i.Inode.Valid(ctx)
+}
+
+// Stat implements kernfs.Inode.Stat.
+func (i *taskOwnedInode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
+	stat, err := i.Inode.Stat(ctx, fs, opts)
 	if err != nil {
 		return linux.Statx{}, err
 	}
@@ -173,7 +191,7 @@ func (i *taskOwnedInode) Stat(fs *vfs.Filesystem, opts vfs.StatOptions) (linux.S
 	return stat, nil
 }
 
-// CheckPermissions implements kernfs.Inode.
+// CheckPermissions implements kernfs.Inode.CheckPermissions.
 func (i *taskOwnedInode) CheckPermissions(_ context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
 	mode := i.Mode()
 	uid, gid := i.getOwner(mode)
@@ -219,11 +237,14 @@ func newIO(t *kernel.Task, isThreadGroup bool) *ioData {
 	return &ioData{ioUsage: t}
 }
 
-// newCgroupData creates inode that shows cgroup information.
-// From man 7 cgroups: "For each cgroup hierarchy of which the process is a
-// member, there is one entry containing three colon-separated fields:
-//   hierarchy-ID:controller-list:cgroup-path"
-func newCgroupData(controllers map[string]string) dynamicInode {
+// newFakeCgroupData creates an inode that shows fake cgroup
+// information passed in as mount options.  From man 7 cgroups: "For
+// each cgroup hierarchy of which the process is a member, there is
+// one entry containing three colon-separated fields:
+// hierarchy-ID:controller-list:cgroup-path"
+//
+// TODO(b/182488796): Remove once all users adopt cgroupfs.
+func newFakeCgroupData(controllers map[string]string) dynamicInode {
 	var buf bytes.Buffer
 
 	// The hierarchy ids must be positive integers (for cgroup v1), but the

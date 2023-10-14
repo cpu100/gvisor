@@ -17,13 +17,11 @@ package mm
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
-	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
-	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -32,18 +30,18 @@ import (
 // +stateify savable
 type aioManager struct {
 	// mu protects below.
-	mu sync.Mutex `state:"nosave"`
+	mu aioManagerMutex `state:"nosave"`
 
 	// aioContexts is the set of asynchronous I/O contexts.
 	contexts map[uint64]*AIOContext
 }
 
-func (a *aioManager) destroy() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+func (mm *MemoryManager) destroyAIOManager(ctx context.Context) {
+	mm.aioManager.mu.Lock()
+	defer mm.aioManager.mu.Unlock()
 
-	for _, ctx := range a.contexts {
-		ctx.destroy()
+	for id := range mm.aioManager.contexts {
+		mm.destroyAIOContextLocked(ctx, id)
 	}
 }
 
@@ -70,16 +68,17 @@ func (a *aioManager) newAIOContext(events uint32, id uint64) bool {
 // be drained.
 //
 // Nil is returned if the context does not exist.
-func (a *aioManager) destroyAIOContext(id uint64) *AIOContext {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	ctx, ok := a.contexts[id]
+//
+// Precondition: mm.aioManager.mu is locked.
+func (mm *MemoryManager) destroyAIOContextLocked(ctx context.Context, id uint64) *AIOContext {
+	aioCtx, ok := mm.aioManager.contexts[id]
 	if !ok {
 		return nil
 	}
-	delete(a.contexts, id)
-	ctx.destroy()
-	return ctx
+
+	delete(mm.aioManager.contexts, id)
+	aioCtx.destroy()
+	return aioCtx
 }
 
 // lookupAIOContext looks up the given context.
@@ -96,7 +95,7 @@ func (a *aioManager) lookupAIOContext(id uint64) (*AIOContext, bool) {
 //
 // +stateify savable
 type ioResult struct {
-	data interface{}
+	data any
 	ioEntry
 }
 
@@ -108,7 +107,7 @@ type AIOContext struct {
 	requestReady chan struct{} `state:"nosave"`
 
 	// mu protects below.
-	mu sync.Mutex `state:"nosave"`
+	mu aioContextMutex `state:"nosave"`
 
 	// results is the set of completed requests.
 	results ioList
@@ -142,21 +141,26 @@ func (ctx *AIOContext) checkForDone() {
 	}
 }
 
-// Prepare reserves space for a new request, returning true if available.
-// Returns false if the context is busy.
-func (ctx *AIOContext) Prepare() bool {
+// Prepare reserves space for a new request, returning nil if available.
+// Returns EAGAIN if the context is busy and EINVAL if the context is dead.
+func (ctx *AIOContext) Prepare() error {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
+	if ctx.dead {
+		// Context died after the caller looked it up.
+		return linuxerr.EINVAL
+	}
 	if ctx.outstanding >= ctx.maxOutstanding {
-		return false
+		// Context is busy.
+		return linuxerr.EAGAIN
 	}
 	ctx.outstanding++
-	return true
+	return nil
 }
 
 // PopRequest pops a completed request if available, this function does not do
 // any blocking. Returns false if no request is available.
-func (ctx *AIOContext) PopRequest() (interface{}, bool) {
+func (ctx *AIOContext) PopRequest() (any, bool) {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 
@@ -175,7 +179,7 @@ func (ctx *AIOContext) PopRequest() (interface{}, bool) {
 
 // FinishRequest finishes a pending request. It queues up the data
 // and notifies listeners.
-func (ctx *AIOContext) FinishRequest(data interface{}) {
+func (ctx *AIOContext) FinishRequest(data any) {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 
@@ -240,27 +244,27 @@ func (ctx *AIOContext) Drain() {
 //
 // +stateify savable
 type aioMappable struct {
-	refs.AtomicRefCount
+	aioMappableRefs
 
 	mfp pgalloc.MemoryFileProvider
-	fr  platform.FileRange
+	fr  memmap.FileRange
 }
 
-var aioRingBufferSize = uint64(usermem.Addr(linux.AIORingSize).MustRoundUp())
+var aioRingBufferSize = uint64(hostarch.Addr(linux.AIORingSize).MustRoundUp())
 
-func newAIOMappable(mfp pgalloc.MemoryFileProvider) (*aioMappable, error) {
-	fr, err := mfp.MemoryFile().Allocate(aioRingBufferSize, usage.Anonymous)
+func newAIOMappable(ctx context.Context, mfp pgalloc.MemoryFileProvider) (*aioMappable, error) {
+	fr, err := mfp.MemoryFile().Allocate(aioRingBufferSize, pgalloc.AllocOpts{Kind: usage.Anonymous, MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx)})
 	if err != nil {
 		return nil, err
 	}
 	m := aioMappable{mfp: mfp, fr: fr}
-	m.EnableLeakCheck("mm.aioMappable")
+	m.InitRefs()
 	return &m, nil
 }
 
 // DecRef implements refs.RefCounter.DecRef.
-func (m *aioMappable) DecRef() {
-	m.AtomicRefCount.DecRefWithDestructor(func() {
+func (m *aioMappable) DecRef(ctx context.Context) {
+	m.aioMappableRefs.DecRef(func() {
 		m.mfp.MemoryFile().DecRef(m.fr)
 	})
 }
@@ -283,35 +287,35 @@ func (m *aioMappable) InodeID() uint64 {
 // Msync implements memmap.MappingIdentity.Msync.
 func (m *aioMappable) Msync(ctx context.Context, mr memmap.MappableRange) error {
 	// Linux: aio_ring_fops.fsync == NULL
-	return syserror.EINVAL
+	return linuxerr.EINVAL
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
-func (m *aioMappable) AddMapping(_ context.Context, _ memmap.MappingSpace, ar usermem.AddrRange, offset uint64, _ bool) error {
+func (m *aioMappable) AddMapping(_ context.Context, _ memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, _ bool) error {
 	// Don't allow mappings to be expanded (in Linux, fs/aio.c:aio_ring_mmap()
 	// sets VM_DONTEXPAND).
 	if offset != 0 || uint64(ar.Length()) != aioRingBufferSize {
-		return syserror.EFAULT
+		return linuxerr.EFAULT
 	}
 	return nil
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
-func (m *aioMappable) RemoveMapping(context.Context, memmap.MappingSpace, usermem.AddrRange, uint64, bool) {
+func (m *aioMappable) RemoveMapping(context.Context, memmap.MappingSpace, hostarch.AddrRange, uint64, bool) {
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
-func (m *aioMappable) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR usermem.AddrRange, offset uint64, _ bool) error {
+func (m *aioMappable) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, _ bool) error {
 	// Don't allow mappings to be expanded (in Linux, fs/aio.c:aio_ring_mmap()
 	// sets VM_DONTEXPAND).
 	if offset != 0 || uint64(dstAR.Length()) != aioRingBufferSize {
-		return syserror.EFAULT
+		return linuxerr.EFAULT
 	}
 	// Require that the mapping correspond to a live AIOContext. Compare
 	// Linux's fs/aio.c:aio_ring_mremap().
 	mm, ok := ms.(*MemoryManager)
 	if !ok {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	am := &mm.aioManager
 	am.mu.Lock()
@@ -319,12 +323,12 @@ func (m *aioMappable) CopyMapping(ctx context.Context, ms memmap.MappingSpace, s
 	oldID := uint64(srcAR.Start)
 	aioCtx, ok := am.contexts[oldID]
 	if !ok {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	aioCtx.mu.Lock()
 	defer aioCtx.mu.Unlock()
 	if aioCtx.dead {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	// Use the new ID for the AIOContext.
 	am.contexts[uint64(dstAR.Start)] = aioCtx
@@ -333,10 +337,10 @@ func (m *aioMappable) CopyMapping(ctx context.Context, ms memmap.MappingSpace, s
 }
 
 // Translate implements memmap.Mappable.Translate.
-func (m *aioMappable) Translate(ctx context.Context, required, optional memmap.MappableRange, at usermem.AccessType) ([]memmap.Translation, error) {
+func (m *aioMappable) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	var err error
 	if required.End > m.fr.Length() {
-		err = &memmap.BusError{syserror.EFAULT}
+		err = &memmap.BusError{linuxerr.EFAULT}
 	}
 	if source := optional.Intersect(memmap.MappableRange{0, m.fr.Length()}); source.Length() != 0 {
 		return []memmap.Translation{
@@ -344,7 +348,7 @@ func (m *aioMappable) Translate(ctx context.Context, required, optional memmap.M
 				Source: source,
 				File:   m.mfp.MemoryFile(),
 				Offset: m.fr.Start + source.Start,
-				Perms:  usermem.AnyAccess,
+				Perms:  hostarch.AnyAccess,
 			},
 		}, err
 	}
@@ -364,11 +368,11 @@ func (mm *MemoryManager) NewAIOContext(ctx context.Context, events uint32) (uint
 	// libaio peeks inside looking for a magic number. This function allocates
 	// a page per context and keeps it set to zeroes to ensure it will not
 	// match AIO_RING_MAGIC and make libaio happy.
-	m, err := newAIOMappable(mm.mfp)
+	m, err := newAIOMappable(ctx, mm.mfp)
 	if err != nil {
 		return 0, err
 	}
-	defer m.DecRef()
+	defer m.DecRef(ctx)
 	addr, err := mm.MMap(ctx, memmap.MMapOpts{
 		Length:          aioRingBufferSize,
 		MappingIdentity: m,
@@ -376,8 +380,8 @@ func (mm *MemoryManager) NewAIOContext(ctx context.Context, events uint32) (uint
 		// Linux uses "do_mmap_pgoff(..., PROT_READ | PROT_WRITE, ...)" in
 		// fs/aio.c:aio_setup_ring(). Since we don't implement AIO_RING_MAGIC,
 		// user mode should not write to this page.
-		Perms:    usermem.Read,
-		MaxPerms: usermem.Read,
+		Perms:    hostarch.Read,
+		MaxPerms: hostarch.Read,
 	})
 	if err != nil {
 		return 0, err
@@ -385,7 +389,7 @@ func (mm *MemoryManager) NewAIOContext(ctx context.Context, events uint32) (uint
 	id := uint64(addr)
 	if !mm.aioManager.newAIOContext(events, id) {
 		mm.MUnmap(ctx, addr, aioRingBufferSize)
-		return 0, syserror.EINVAL
+		return 0, linuxerr.EINVAL
 	}
 	return id, nil
 }
@@ -393,7 +397,7 @@ func (mm *MemoryManager) NewAIOContext(ctx context.Context, events uint32) (uint
 // DestroyAIOContext destroys an asynchronous I/O context. It returns the
 // destroyed context. nil if the context does not exist.
 func (mm *MemoryManager) DestroyAIOContext(ctx context.Context, id uint64) *AIOContext {
-	if _, ok := mm.LookupAIOContext(ctx, id); !ok {
+	if !mm.isValidAddr(ctx, id) {
 		return nil
 	}
 
@@ -404,9 +408,11 @@ func (mm *MemoryManager) DestroyAIOContext(ctx context.Context, id uint64) *AIOC
 	// the same address. Then it would be unmapping memory that it doesn't own.
 	// This is, however, the way Linux implements AIO. Keeps the same [weird]
 	// semantics in case anyone relies on it.
-	mm.MUnmap(ctx, usermem.Addr(id), aioRingBufferSize)
+	mm.MUnmap(ctx, hostarch.Addr(id), aioRingBufferSize)
 
-	return mm.aioManager.destroyAIOContext(id)
+	mm.aioManager.mu.Lock()
+	defer mm.aioManager.mu.Unlock()
+	return mm.destroyAIOContextLocked(ctx, id)
 }
 
 // LookupAIOContext looks up the given context. It returns false if the context
@@ -417,13 +423,18 @@ func (mm *MemoryManager) LookupAIOContext(ctx context.Context, id uint64) (*AIOC
 		return nil, false
 	}
 
-	// Protect against 'ids' that are inaccessible (Linux also reads 4 bytes
-	// from id).
-	var buf [4]byte
-	_, err := mm.CopyIn(ctx, usermem.Addr(id), buf[:], usermem.IOOpts{})
-	if err != nil {
+	// Protect against 'id' that is inaccessible.
+	if !mm.isValidAddr(ctx, id) {
 		return nil, false
 	}
 
 	return aioCtx, true
+}
+
+// isValidAddr determines if the address `id` is valid. (Linux also reads 4
+// bytes from id).
+func (mm *MemoryManager) isValidAddr(ctx context.Context, id uint64) bool {
+	var buf [4]byte
+	_, err := mm.CopyIn(ctx, hostarch.Addr(id), buf[:], usermem.IOOpts{})
+	return err == nil
 }

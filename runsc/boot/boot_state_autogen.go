@@ -6,30 +6,35 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *sandboxNetstackCreator) StateTypeName() string {
+func (f *sandboxNetstackCreator) StateTypeName() string {
 	return "runsc/boot.sandboxNetstackCreator"
 }
 
-func (x *sandboxNetstackCreator) StateFields() []string {
+func (f *sandboxNetstackCreator) StateFields() []string {
 	return []string{
 		"clock",
 		"uniqueID",
+		"allowPacketEndpointWrite",
 	}
 }
 
-func (x *sandboxNetstackCreator) beforeSave() {}
+func (f *sandboxNetstackCreator) beforeSave() {}
 
-func (x *sandboxNetstackCreator) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.clock)
-	m.Save(1, &x.uniqueID)
+// +checklocksignore
+func (f *sandboxNetstackCreator) StateSave(stateSinkObject state.Sink) {
+	f.beforeSave()
+	stateSinkObject.Save(0, &f.clock)
+	stateSinkObject.Save(1, &f.uniqueID)
+	stateSinkObject.Save(2, &f.allowPacketEndpointWrite)
 }
 
-func (x *sandboxNetstackCreator) afterLoad() {}
+func (f *sandboxNetstackCreator) afterLoad() {}
 
-func (x *sandboxNetstackCreator) StateLoad(m state.Source) {
-	m.Load(0, &x.clock)
-	m.Load(1, &x.uniqueID)
+// +checklocksignore
+func (f *sandboxNetstackCreator) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &f.clock)
+	stateSourceObject.Load(1, &f.uniqueID)
+	stateSourceObject.Load(2, &f.allowPacketEndpointWrite)
 }
 
 func init() {

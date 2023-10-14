@@ -6,35 +6,16 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *Socket) StateTypeName() string {
+func (s *Socket) StateTypeName() string {
 	return "pkg/sentry/socket/netlink.Socket"
 }
 
-func (x *Socket) StateFields() []string {
+func (s *Socket) StateFields() []string {
 	return []string{
-		"socketOpsCommon",
-	}
-}
-
-func (x *Socket) beforeSave() {}
-
-func (x *Socket) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.socketOpsCommon)
-}
-
-func (x *Socket) afterLoad() {}
-
-func (x *Socket) StateLoad(m state.Source) {
-	m.Load(0, &x.socketOpsCommon)
-}
-
-func (x *socketOpsCommon) StateTypeName() string {
-	return "pkg/sentry/socket/netlink.socketOpsCommon"
-}
-
-func (x *socketOpsCommon) StateFields() []string {
-	return []string{
+		"vfsfd",
+		"FileDescriptionDefaultImpl",
+		"DentryMetadataFileDescriptionImpl",
+		"LockFD",
 		"SendReceiveTimeout",
 		"ports",
 		"protocol",
@@ -44,65 +25,73 @@ func (x *socketOpsCommon) StateFields() []string {
 		"bound",
 		"portID",
 		"sendBufferSize",
-		"passcred",
 		"filter",
 	}
 }
 
-func (x *socketOpsCommon) beforeSave() {}
+func (s *Socket) beforeSave() {}
 
-func (x *socketOpsCommon) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.SendReceiveTimeout)
-	m.Save(1, &x.ports)
-	m.Save(2, &x.protocol)
-	m.Save(3, &x.skType)
-	m.Save(4, &x.ep)
-	m.Save(5, &x.connection)
-	m.Save(6, &x.bound)
-	m.Save(7, &x.portID)
-	m.Save(8, &x.sendBufferSize)
-	m.Save(9, &x.passcred)
-	m.Save(10, &x.filter)
+// +checklocksignore
+func (s *Socket) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.vfsfd)
+	stateSinkObject.Save(1, &s.FileDescriptionDefaultImpl)
+	stateSinkObject.Save(2, &s.DentryMetadataFileDescriptionImpl)
+	stateSinkObject.Save(3, &s.LockFD)
+	stateSinkObject.Save(4, &s.SendReceiveTimeout)
+	stateSinkObject.Save(5, &s.ports)
+	stateSinkObject.Save(6, &s.protocol)
+	stateSinkObject.Save(7, &s.skType)
+	stateSinkObject.Save(8, &s.ep)
+	stateSinkObject.Save(9, &s.connection)
+	stateSinkObject.Save(10, &s.bound)
+	stateSinkObject.Save(11, &s.portID)
+	stateSinkObject.Save(12, &s.sendBufferSize)
+	stateSinkObject.Save(13, &s.filter)
 }
 
-func (x *socketOpsCommon) afterLoad() {}
+func (s *Socket) afterLoad() {}
 
-func (x *socketOpsCommon) StateLoad(m state.Source) {
-	m.Load(0, &x.SendReceiveTimeout)
-	m.Load(1, &x.ports)
-	m.Load(2, &x.protocol)
-	m.Load(3, &x.skType)
-	m.Load(4, &x.ep)
-	m.Load(5, &x.connection)
-	m.Load(6, &x.bound)
-	m.Load(7, &x.portID)
-	m.Load(8, &x.sendBufferSize)
-	m.Load(9, &x.passcred)
-	m.Load(10, &x.filter)
+// +checklocksignore
+func (s *Socket) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.vfsfd)
+	stateSourceObject.Load(1, &s.FileDescriptionDefaultImpl)
+	stateSourceObject.Load(2, &s.DentryMetadataFileDescriptionImpl)
+	stateSourceObject.Load(3, &s.LockFD)
+	stateSourceObject.Load(4, &s.SendReceiveTimeout)
+	stateSourceObject.Load(5, &s.ports)
+	stateSourceObject.Load(6, &s.protocol)
+	stateSourceObject.Load(7, &s.skType)
+	stateSourceObject.Load(8, &s.ep)
+	stateSourceObject.Load(9, &s.connection)
+	stateSourceObject.Load(10, &s.bound)
+	stateSourceObject.Load(11, &s.portID)
+	stateSourceObject.Load(12, &s.sendBufferSize)
+	stateSourceObject.Load(13, &s.filter)
 }
 
-func (x *kernelSCM) StateTypeName() string {
+func (k *kernelSCM) StateTypeName() string {
 	return "pkg/sentry/socket/netlink.kernelSCM"
 }
 
-func (x *kernelSCM) StateFields() []string {
+func (k *kernelSCM) StateFields() []string {
 	return []string{}
 }
 
-func (x *kernelSCM) beforeSave() {}
+func (k *kernelSCM) beforeSave() {}
 
-func (x *kernelSCM) StateSave(m state.Sink) {
-	x.beforeSave()
+// +checklocksignore
+func (k *kernelSCM) StateSave(stateSinkObject state.Sink) {
+	k.beforeSave()
 }
 
-func (x *kernelSCM) afterLoad() {}
+func (k *kernelSCM) afterLoad() {}
 
-func (x *kernelSCM) StateLoad(m state.Source) {
+// +checklocksignore
+func (k *kernelSCM) StateLoad(stateSourceObject state.Source) {
 }
 
 func init() {
 	state.Register((*Socket)(nil))
-	state.Register((*socketOpsCommon)(nil))
 	state.Register((*kernelSCM)(nil))
 }

@@ -15,11 +15,8 @@
 package transport
 
 import (
-	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/syserr"
-	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -27,12 +24,12 @@ import (
 //
 // +stateify savable
 type queue struct {
-	refs.AtomicRefCount
+	queueRefs
 
 	ReaderQueue *waiter.Queue
 	WriterQueue *waiter.Queue
 
-	mu       sync.Mutex `state:"nosave"`
+	mu       queueMutex `state:"nosave"`
 	closed   bool
 	unread   bool
 	used     int64
@@ -44,8 +41,8 @@ type queue struct {
 // will become unreadable when no more data is pending.
 //
 // Both the read and write queues must be notified after closing:
-// q.ReaderQueue.Notify(waiter.EventIn)
-// q.WriterQueue.Notify(waiter.EventOut)
+// q.ReaderQueue.Notify(waiter.ReadableEvents)
+// q.WriterQueue.Notify(waiter.WritableEvents)
 func (q *queue) Close() {
 	q.mu.Lock()
 	q.closed = true
@@ -55,23 +52,27 @@ func (q *queue) Close() {
 // Reset empties the queue and Releases all of the Entries.
 //
 // Both the read and write queues must be notified after resetting:
-// q.ReaderQueue.Notify(waiter.EventIn)
-// q.WriterQueue.Notify(waiter.EventOut)
-func (q *queue) Reset() {
+// q.ReaderQueue.Notify(waiter.ReadableEvents)
+// q.WriterQueue.Notify(waiter.WritableEvents)
+func (q *queue) Reset(ctx context.Context) {
 	q.mu.Lock()
-	for cur := q.dataList.Front(); cur != nil; cur = cur.Next() {
-		cur.Release()
-	}
+	dataList := q.dataList
 	q.dataList.Reset()
 	q.used = 0
 	q.mu.Unlock()
+
+	for cur := dataList.Front(); cur != nil; cur = cur.Next() {
+		cur.Release(ctx)
+	}
 }
 
-// DecRef implements RefCounter.DecRef with destructor q.Reset.
-func (q *queue) DecRef() {
-	q.DecRefWithDestructor(q.Reset)
-	// We don't need to notify after resetting because no one cares about
-	// this queue after all references have been dropped.
+// DecRef implements RefCounter.DecRef.
+func (q *queue) DecRef(ctx context.Context) {
+	q.queueRefs.DecRef(func() {
+		// We don't need to notify after resetting because no one cares about
+		// this queue after all references have been dropped.
+		q.Reset(ctx)
+	})
 }
 
 // IsReadable determines if q is currently readable.
@@ -110,8 +111,8 @@ func (q *queue) IsWritable() bool {
 // err indicates why.
 //
 // If notify is true, ReaderQueue.Notify must be called:
-// q.ReaderQueue.Notify(waiter.EventIn)
-func (q *queue) Enqueue(data [][]byte, c ControlMessages, from tcpip.FullAddress, discardEmpty bool, truncate bool) (l int64, notify bool, err *syserr.Error) {
+// q.ReaderQueue.Notify(waiter.ReadableEvents)
+func (q *queue) Enqueue(ctx context.Context, data [][]byte, c ControlMessages, from Address, discardEmpty bool, truncate bool) (l int64, notify bool, err *syserr.Error) {
 	q.mu.Lock()
 
 	if q.closed {
@@ -124,14 +125,14 @@ func (q *queue) Enqueue(data [][]byte, c ControlMessages, from tcpip.FullAddress
 	}
 	if discardEmpty && l == 0 {
 		q.mu.Unlock()
-		c.Release()
+		c.Release(ctx)
 		return 0, false, nil
 	}
 
 	free := q.limit - q.used
 
 	if l > free && truncate {
-		if free == 0 {
+		if free <= 0 {
 			// Message can't fit right now.
 			q.mu.Unlock()
 			return 0, false, syserr.ErrWouldBlock
@@ -164,7 +165,7 @@ func (q *queue) Enqueue(data [][]byte, c ControlMessages, from tcpip.FullAddress
 	notify = q.dataList.Front() == nil
 	q.used += l
 	q.dataList.PushBack(&message{
-		Data:    buffer.View(v),
+		Data:    v,
 		Control: c,
 		Address: from,
 	})
@@ -177,7 +178,7 @@ func (q *queue) Enqueue(data [][]byte, c ControlMessages, from tcpip.FullAddress
 // Dequeue removes the first entry in the data queue, if one exists.
 //
 // If notify is true, WriterQueue.Notify must be called:
-// q.WriterQueue.Notify(waiter.EventOut)
+// q.WriterQueue.Notify(waiter.WritableEvents)
 func (q *queue) Dequeue() (e *message, notify bool, err *syserr.Error) {
 	q.mu.Lock()
 
@@ -235,7 +236,16 @@ func (q *queue) QueuedSize() int64 {
 
 // MaxQueueSize returns the maximum number of bytes storable in the queue.
 func (q *queue) MaxQueueSize() int64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	return q.limit
+}
+
+// SetMaxQueueSize sets the maximum number of bytes storable in the queue.
+func (q *queue) SetMaxQueueSize(v int64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.limit = v
 }
 
 // CloseUnread sets flag to indicate that the peer is closed (not shutdown)

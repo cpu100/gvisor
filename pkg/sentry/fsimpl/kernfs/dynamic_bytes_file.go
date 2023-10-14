@@ -19,15 +19,16 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
-// DynamicBytesFile implements kernfs.Inode and represents a read-only
-// file whose contents are backed by a vfs.DynamicBytesSource.
+// DynamicBytesFile implements kernfs.Inode and represents a read-only file
+// whose contents are backed by a vfs.DynamicBytesSource. If data additionally
+// implements vfs.WritableDynamicBytesSource, the file also supports dispatching
+// writes to the implementer, but note that this will not update the source data.
 //
 // Must be instantiated with NewDynamicBytesFile or initialized with Init
 // before first use.
@@ -35,29 +36,35 @@ import (
 // +stateify savable
 type DynamicBytesFile struct {
 	InodeAttrs
+	InodeNoStatFS
 	InodeNoopRefCount
+	InodeNotAnonymous
 	InodeNotDirectory
 	InodeNotSymlink
+	InodeWatches
 
 	locks vfs.FileLocks
-	data  vfs.DynamicBytesSource
+	// data can additionally implement vfs.WritableDynamicBytesSource to support
+	// writes. This field cannot be changed to a different bytes source after
+	// Init.
+	data vfs.DynamicBytesSource
 }
 
 var _ Inode = (*DynamicBytesFile)(nil)
 
 // Init initializes a dynamic bytes file.
-func (f *DynamicBytesFile) Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, data vfs.DynamicBytesSource, perm linux.FileMode) {
+func (f *DynamicBytesFile) Init(ctx context.Context, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, data vfs.DynamicBytesSource, perm linux.FileMode) {
 	if perm&^linux.PermissionsMask != 0 {
 		panic(fmt.Sprintf("Only permission mask must be set: %x", perm&linux.PermissionsMask))
 	}
-	f.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeRegular|perm)
+	f.InodeAttrs.Init(ctx, creds, devMajor, devMinor, ino, linux.ModeRegular|perm)
 	f.data = data
 }
 
 // Open implements Inode.Open.
-func (f *DynamicBytesFile) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+func (f *DynamicBytesFile) Open(ctx context.Context, rp *vfs.ResolvingPath, d *Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd := &DynamicBytesFD{}
-	if err := fd.Init(rp.Mount(), vfsd, f.data, &f.locks, opts.Flags); err != nil {
+	if err := fd.Init(rp.Mount(), d, f.data, &f.locks, opts.Flags); err != nil {
 		return nil, err
 	}
 	return &fd.vfsfd, nil
@@ -67,7 +74,17 @@ func (f *DynamicBytesFile) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd
 // inode attributes to be changed. Override SetStat() making it call
 // f.InodeAttrs to allow it.
 func (*DynamicBytesFile) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
-	return syserror.EPERM
+	return linuxerr.EPERM
+}
+
+// Locks returns the file locks for this file.
+func (f *DynamicBytesFile) Locks() *vfs.FileLocks {
+	return &f.locks
+}
+
+// Data returns the underlying data source.
+func (f *DynamicBytesFile) Data() vfs.DynamicBytesSource {
+	return f.data
 }
 
 // DynamicBytesFD implements vfs.FileDescriptionImpl for an FD backed by a
@@ -86,13 +103,17 @@ type DynamicBytesFD struct {
 }
 
 // Init initializes a DynamicBytesFD.
-func (fd *DynamicBytesFD) Init(m *vfs.Mount, d *vfs.Dentry, data vfs.DynamicBytesSource, locks *vfs.FileLocks, flags uint32) error {
+func (fd *DynamicBytesFD) Init(m *vfs.Mount, d *Dentry, data vfs.DynamicBytesSource, locks *vfs.FileLocks, flags uint32) error {
 	fd.LockFD.Init(locks)
-	if err := fd.vfsfd.Init(fd, flags, m, d, &vfs.FileDescriptionOptions{}); err != nil {
+	if err := fd.vfsfd.Init(fd, flags, m, d.VFSDentry(),
+		&vfs.FileDescriptionOptions{
+			DenySpliceIn: true,
+		},
+	); err != nil {
 		return err
 	}
-	fd.inode = d.Impl().(*Dentry).inode
-	fd.SetDataSource(data)
+	fd.inode = d.inode
+	fd.DynamicBytesFileDescriptionImpl.Init(&fd.vfsfd, data)
 	return nil
 }
 
@@ -122,26 +143,16 @@ func (fd *DynamicBytesFD) PWrite(ctx context.Context, src usermem.IOSequence, of
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
-func (fd *DynamicBytesFD) Release() {}
+func (fd *DynamicBytesFD) Release(context.Context) {}
 
 // Stat implements vfs.FileDescriptionImpl.Stat.
 func (fd *DynamicBytesFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
 	fs := fd.vfsfd.VirtualDentry().Mount().Filesystem()
-	return fd.inode.Stat(fs, opts)
+	return fd.inode.Stat(ctx, fs, opts)
 }
 
 // SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (fd *DynamicBytesFD) SetStat(context.Context, vfs.SetStatOptions) error {
 	// DynamicBytesFiles are immutable.
-	return syserror.EPERM
-}
-
-// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (fd *DynamicBytesFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
-	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
-}
-
-// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (fd *DynamicBytesFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
+	return linuxerr.EPERM
 }

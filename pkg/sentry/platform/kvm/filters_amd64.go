@@ -15,19 +15,37 @@
 package kvm
 
 import (
-	"syscall"
+	"golang.org/x/sys/unix"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/seccomp"
 )
 
-// SyscallFilters returns syscalls made exclusively by the KVM platform.
-func (*KVM) SyscallFilters() seccomp.SyscallRules {
-	return seccomp.SyscallRules{
-		syscall.SYS_ARCH_PRCTL:      {},
-		syscall.SYS_IOCTL:           {},
-		syscall.SYS_MMAP:            {},
-		syscall.SYS_RT_SIGSUSPEND:   {},
-		syscall.SYS_RT_SIGTIMEDWAIT: {},
-		0xffffffffffffffff:          {}, // KVM uses syscall -1 to transition to host.
-	}
+// archSyscallFilters returns arch-specific syscalls made exclusively by the
+// KVM platform.
+func (k *KVM) archSyscallFilters() seccomp.SyscallRules {
+	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+		unix.SYS_ARCH_PRCTL: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.EqualTo(linux.ARCH_GET_FS),
+			},
+			seccomp.PerArg{
+				seccomp.EqualTo(linux.ARCH_GET_GS),
+			},
+		},
+		unix.SYS_IOCTL: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.AnyValue{},
+				seccomp.EqualTo(KVM_INTERRUPT),
+			},
+			seccomp.PerArg{
+				seccomp.AnyValue{},
+				seccomp.EqualTo(KVM_NMI),
+			},
+			seccomp.PerArg{
+				seccomp.AnyValue{},
+				seccomp.EqualTo(KVM_GET_REGS),
+			},
+		},
+	})
 }

@@ -16,20 +16,22 @@ package tmpfs
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 )
 
+// +stateify savable
 type symlink struct {
 	inode  inode
 	target string // immutable
 }
 
-func (fs *filesystem) newSymlink(kuid auth.KUID, kgid auth.KGID, mode linux.FileMode, target string) *inode {
+func (fs *filesystem) newSymlink(kuid auth.KUID, kgid auth.KGID, mode linux.FileMode, target string, parentDir *directory) *inode {
 	link := &symlink{
 		target: target,
 	}
-	link.inode.init(link, fs, kuid, kgid, linux.S_IFLNK|mode)
-	link.inode.nlink = 1 // from parent directory
+	link.inode.init(link, fs, kuid, kgid, linux.S_IFLNK|mode, parentDir)
+	link.inode.nlink = atomicbitops.FromUint32(1) // from parent directory
 	return &link.inode
 }
 

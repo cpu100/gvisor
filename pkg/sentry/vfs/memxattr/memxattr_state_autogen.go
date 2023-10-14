@@ -18,15 +18,17 @@ func (x *SimpleExtendedAttributes) StateFields() []string {
 
 func (x *SimpleExtendedAttributes) beforeSave() {}
 
-func (x *SimpleExtendedAttributes) StateSave(m state.Sink) {
+// +checklocksignore
+func (x *SimpleExtendedAttributes) StateSave(stateSinkObject state.Sink) {
 	x.beforeSave()
-	m.Save(0, &x.xattrs)
+	stateSinkObject.Save(0, &x.xattrs)
 }
 
 func (x *SimpleExtendedAttributes) afterLoad() {}
 
-func (x *SimpleExtendedAttributes) StateLoad(m state.Source) {
-	m.Load(0, &x.xattrs)
+// +checklocksignore
+func (x *SimpleExtendedAttributes) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &x.xattrs)
 }
 
 func init() {

@@ -15,22 +15,41 @@
 package kernfs
 
 import (
-	"math"
+	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
+// SeekEndConfig describes the SEEK_END behaviour for FDs.
+//
+// +stateify savable
+type SeekEndConfig int
+
+// Constants related to SEEK_END behaviour for FDs.
+const (
+	// Consider the end of the file to be after the final static entry. This is
+	// the default option.
+	SeekEndStaticEntries = iota
+	// Consider the end of the file to be at offset 0.
+	SeekEndZero
+)
+
+// GenericDirectoryFDOptions contains configuration for a GenericDirectoryFD.
+//
+// +stateify savable
+type GenericDirectoryFDOptions struct {
+	SeekEnd SeekEndConfig
+}
+
 // GenericDirectoryFD implements vfs.FileDescriptionImpl for a generic directory
-// inode that uses OrderChildren to track child nodes. GenericDirectoryFD is not
-// compatible with dynamic directories.
+// inode that uses OrderChildren to track child nodes.
 //
 // Note that GenericDirectoryFD holds a lock over OrderedChildren while calling
 // IterDirents callback. The IterDirents callback therefore cannot hash or
@@ -40,16 +59,21 @@ import (
 // Must be initialize with Init before first use.
 //
 // Lock ordering: mu => children.mu.
+//
+// +stateify savable
 type GenericDirectoryFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.DirectoryFileDescriptionDefaultImpl
 	vfs.LockFD
 
+	// Immutable.
+	seekEnd SeekEndConfig
+
 	vfsfd    vfs.FileDescription
 	children *OrderedChildren
 
 	// mu protects the fields below.
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
 
 	// off is the current directory offset. Protected by "mu".
 	off int64
@@ -57,12 +81,12 @@ type GenericDirectoryFD struct {
 
 // NewGenericDirectoryFD creates a new GenericDirectoryFD and returns its
 // dentry.
-func NewGenericDirectoryFD(m *vfs.Mount, d *vfs.Dentry, children *OrderedChildren, locks *vfs.FileLocks, opts *vfs.OpenOptions) (*GenericDirectoryFD, error) {
+func NewGenericDirectoryFD(m *vfs.Mount, d *Dentry, children *OrderedChildren, locks *vfs.FileLocks, opts *vfs.OpenOptions, fdOpts GenericDirectoryFDOptions) (*GenericDirectoryFD, error) {
 	fd := &GenericDirectoryFD{}
-	if err := fd.Init(children, locks, opts); err != nil {
+	if err := fd.Init(children, locks, opts, fdOpts); err != nil {
 		return nil, err
 	}
-	if err := fd.vfsfd.Init(fd, opts.Flags, m, d, &vfs.FileDescriptionOptions{}); err != nil {
+	if err := fd.vfsfd.Init(fd, opts.Flags, m, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
 	}
 	return fd, nil
@@ -71,12 +95,13 @@ func NewGenericDirectoryFD(m *vfs.Mount, d *vfs.Dentry, children *OrderedChildre
 // Init initializes a GenericDirectoryFD. Use it when overriding
 // GenericDirectoryFD. Caller must call fd.VFSFileDescription.Init() with the
 // correct implementation.
-func (fd *GenericDirectoryFD) Init(children *OrderedChildren, locks *vfs.FileLocks, opts *vfs.OpenOptions) error {
+func (fd *GenericDirectoryFD) Init(children *OrderedChildren, locks *vfs.FileLocks, opts *vfs.OpenOptions, fdOpts GenericDirectoryFDOptions) error {
 	if vfs.AccessTypesForOpenFlags(opts)&vfs.MayWrite != 0 {
 		// Can't open directories for writing.
-		return syserror.EISDIR
+		return linuxerr.EISDIR
 	}
 	fd.LockFD.Init(locks)
+	fd.seekEnd = fdOpts.SeekEnd
 	fd.children = children
 	return nil
 }
@@ -112,18 +137,22 @@ func (fd *GenericDirectoryFD) PWrite(ctx context.Context, src usermem.IOSequence
 	return fd.DirectoryFileDescriptionDefaultImpl.PWrite(ctx, src, offset, opts)
 }
 
-// Release implements vfs.FileDecriptionImpl.Release.
-func (fd *GenericDirectoryFD) Release() {}
+// Release implements vfs.FileDescriptionImpl.Release.
+func (fd *GenericDirectoryFD) Release(context.Context) {}
 
 func (fd *GenericDirectoryFD) filesystem() *vfs.Filesystem {
 	return fd.vfsfd.VirtualDentry().Mount().Filesystem()
 }
 
-func (fd *GenericDirectoryFD) inode() Inode {
-	return fd.vfsfd.VirtualDentry().Dentry().Impl().(*Dentry).inode
+func (fd *GenericDirectoryFD) dentry() *Dentry {
+	return fd.vfsfd.Dentry().Impl().(*Dentry)
 }
 
-// IterDirents implements vfs.FileDecriptionImpl.IterDirents. IterDirents holds
+func (fd *GenericDirectoryFD) inode() Inode {
+	return fd.dentry().inode
+}
+
+// IterDirents implements vfs.FileDescriptionImpl.IterDirents. IterDirents holds
 // o.mu when calling cb.
 func (fd *GenericDirectoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback) error {
 	fd.mu.Lock()
@@ -132,7 +161,7 @@ func (fd *GenericDirectoryFD) IterDirents(ctx context.Context, cb vfs.IterDirent
 	opts := vfs.StatOptions{Mask: linux.STATX_INO}
 	// Handle ".".
 	if fd.off == 0 {
-		stat, err := fd.inode().Stat(fd.filesystem(), opts)
+		stat, err := fd.inode().Stat(ctx, fd.filesystem(), opts)
 		if err != nil {
 			return err
 		}
@@ -150,9 +179,8 @@ func (fd *GenericDirectoryFD) IterDirents(ctx context.Context, cb vfs.IterDirent
 
 	// Handle "..".
 	if fd.off == 1 {
-		vfsd := fd.vfsfd.VirtualDentry().Dentry()
-		parentInode := genericParentOrSelf(vfsd.Impl().(*Dentry)).inode
-		stat, err := parentInode.Stat(fd.filesystem(), opts)
+		parentInode := genericParentOrSelf(fd.dentry()).inode
+		stat, err := parentInode.Stat(ctx, fd.filesystem(), opts)
 		if err != nil {
 			return err
 		}
@@ -175,13 +203,12 @@ func (fd *GenericDirectoryFD) IterDirents(ctx context.Context, cb vfs.IterDirent
 	// these.
 	childIdx := fd.off - 2
 	for it := fd.children.nthLocked(childIdx); it != nil; it = it.Next() {
-		inode := it.Dentry.Impl().(*Dentry).inode
-		stat, err := inode.Stat(fd.filesystem(), opts)
+		stat, err := it.inode.Stat(ctx, fd.filesystem(), opts)
 		if err != nil {
 			return err
 		}
 		dirent := vfs.Dirent{
-			Name:    it.Name,
+			Name:    it.name,
 			Type:    linux.FileMode(stat.Mode).DirentType(),
 			Ino:     stat.Ino,
 			NextOff: fd.off + 1,
@@ -194,11 +221,11 @@ func (fd *GenericDirectoryFD) IterDirents(ctx context.Context, cb vfs.IterDirent
 
 	var err error
 	relOffset := fd.off - int64(len(fd.children.set)) - 2
-	fd.off, err = fd.inode().IterDirents(ctx, cb, fd.off, relOffset)
+	fd.off, err = fd.inode().IterDirents(ctx, fd.vfsfd.Mount(), cb, fd.off, relOffset)
 	return err
 }
 
-// Seek implements vfs.FileDecriptionImpl.Seek.
+// Seek implements vfs.FileDescriptionImpl.Seek.
 func (fd *GenericDirectoryFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
@@ -209,14 +236,22 @@ func (fd *GenericDirectoryFD) Seek(ctx context.Context, offset int64, whence int
 	case linux.SEEK_CUR:
 		offset += fd.off
 	case linux.SEEK_END:
-		// TODO(gvisor.dev/issue/1193): This can prevent new files from showing up
-		// if they are added after SEEK_END.
-		offset = math.MaxInt64
+		switch fd.seekEnd {
+		case SeekEndStaticEntries:
+			fd.children.mu.RLock()
+			offset += int64(len(fd.children.set))
+			offset += 2 // '.' and '..' aren't tracked in children.
+			fd.children.mu.RUnlock()
+		case SeekEndZero:
+			// No-op: offset += 0.
+		default:
+			panic(fmt.Sprintf("Invalid GenericDirectoryFD.seekEnd = %v", fd.seekEnd))
+		}
 	default:
-		return 0, syserror.EINVAL
+		return 0, linuxerr.EINVAL
 	}
 	if offset < 0 {
-		return 0, syserror.EINVAL
+		return 0, linuxerr.EINVAL
 	}
 	fd.off = offset
 	return offset, nil
@@ -226,22 +261,16 @@ func (fd *GenericDirectoryFD) Seek(ctx context.Context, offset int64, whence int
 func (fd *GenericDirectoryFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
 	fs := fd.filesystem()
 	inode := fd.inode()
-	return inode.Stat(fs, opts)
+	return inode.Stat(ctx, fs, opts)
 }
 
 // SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (fd *GenericDirectoryFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
 	creds := auth.CredentialsFromContext(ctx)
-	inode := fd.vfsfd.VirtualDentry().Dentry().Impl().(*Dentry).inode
-	return inode.SetStat(ctx, fd.filesystem(), creds, opts)
+	return fd.inode().SetStat(ctx, fd.filesystem(), creds, opts)
 }
 
-// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (fd *GenericDirectoryFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
-	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
-}
-
-// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (fd *GenericDirectoryFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
+// Allocate implements vfs.FileDescriptionImpl.Allocate.
+func (fd *GenericDirectoryFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	return fd.DirectoryFileDescriptionDefaultImpl.Allocate(ctx, mode, offset, length)
 }

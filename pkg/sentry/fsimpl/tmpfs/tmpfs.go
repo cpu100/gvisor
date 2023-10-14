@@ -17,14 +17,15 @@
 //
 // Lock order:
 //
-// filesystem.mu
-//   inode.mu
-//     regularFileFD.offMu
-//       *** "memmap.Mappable locks" below this point
-//       regularFile.mapsMu
-//         *** "memmap.Mappable locks taken by Translate" below this point
-//         regularFile.dataMu
-//     directory.iterMu
+//	filesystem.mu
+//		inode.mu
+//		  regularFileFD.offMu
+//		    *** "memmap.Mappable locks" below this point
+//		    regularFile.mapsMu
+//		      *** "memmap.Mappable locks taken by Translate" below this point
+//		      regularFile.dataMu
+//		        fs.pagesUsedMu
+//		  directory.iterMu
 package tmpfs
 
 import (
@@ -35,30 +36,44 @@ import (
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
-	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/vfs/memxattr"
-	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // Name is the default filesystem name.
 const Name = "tmpfs"
 
 // FilesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type FilesystemType struct{}
 
 // filesystem implements vfs.FilesystemImpl.
+//
+// +stateify savable
 type filesystem struct {
 	vfsfs vfs.Filesystem
 
-	// memFile is used to allocate pages to for regular files.
-	memFile *pgalloc.MemoryFile
+	// mf is used to allocate memory that stores regular file contents. mf is
+	// immutable, except it may to changed during restore.
+	mf *pgalloc.MemoryFile `state:"nosave"`
+
+	// privateMF indicates whether mf is private to this tmpfs mount. If so,
+	// tmpfs takes ownership of mf. privateMF is immutable.
+	privateMF bool
+
+	// mfp is used to provide mf, when privateMF == false. This is required to
+	// re-provide mf on restore. mfp is immutable.
+	mfp pgalloc.MemoryFileProvider
 
 	// clock is a realtime clock used to set timestamps in file operations.
 	clock time.Clock
@@ -66,10 +81,33 @@ type filesystem struct {
 	// devMinor is the filesystem's minor device number. devMinor is immutable.
 	devMinor uint32
 
-	// mu serializes changes to the Dentry tree.
-	mu sync.RWMutex
+	// mopts contains the tmpfs-specific mount options passed to this
+	// filesystem. Immutable.
+	mopts string
 
-	nextInoMinusOne uint64 // accessed using atomic memory operations
+	// usage is the memory accounting category under which pages backing
+	// files in this filesystem are accounted.
+	usage usage.MemoryKind
+
+	// mu serializes changes to the Dentry tree.
+	mu filesystemRWMutex `state:"nosave"`
+
+	nextInoMinusOne atomicbitops.Uint64 // accessed using atomic memory operations
+
+	root *dentry
+
+	maxFilenameLen int
+
+	// maxSizeInPages is the maximum permissible size for the tmpfs in terms of pages.
+	// This field is immutable.
+	maxSizeInPages uint64
+
+	// pagesUsed is the number of pages used by this filesystem.
+	pagesUsed atomicbitops.Uint64
+
+	// allowXattrPrefix is a set of xattr namespace prefixes that this
+	// tmpfs mount will allow. It is immutable.
+	allowXattrPrefix map[string]struct{}
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -77,7 +115,12 @@ func (FilesystemType) Name() string {
 	return Name
 }
 
+// Release implements vfs.FilesystemType.Release.
+func (FilesystemType) Release(ctx context.Context) {}
+
 // FilesystemOpts is used to pass configuration data to tmpfs.
+//
+// +stateify savable
 type FilesystemOpts struct {
 	// RootFileType is the FileType of the filesystem root. Valid values
 	// are: S_IFDIR, S_IFREG, and S_IFLNK. Defaults to S_IFDIR.
@@ -91,24 +134,105 @@ type FilesystemOpts struct {
 	// tmpfs filesystem. This allows tmpfs to "impersonate" other
 	// filesystems, like ramdiskfs and cgroupfs.
 	FilesystemType vfs.FilesystemType
+
+	// Usage is the memory accounting category under which pages backing files in
+	// the filesystem are accounted.
+	Usage *usage.MemoryKind
+
+	// MaxFilenameLen is the maximum filename length allowed by the tmpfs.
+	MaxFilenameLen int
+
+	// FilestoreFD is the FD for the memory file that will be used to store file
+	// data. If this is nil, then MemoryFileProviderFromContext() is used.
+	FilestoreFD *fd.FD
+
+	// DisableDefaultSizeLimit disables setting a default size limit. In Linux,
+	// SB_KERNMOUNT has this effect on tmpfs mounts; see mm/shmem.c:shmem_fill_super().
+	DisableDefaultSizeLimit bool
+
+	// AllowXattrPrefix is a set of xattr namespace prefixes that this
+	// tmpfs mount will allow.
+	AllowXattrPrefix []string
+}
+
+// Default size limit mount option. It is immutable after initialization.
+var defaultSizeLimit uint64
+
+// SetDefaultSizeLimit configures the size limit to be used for tmpfs mounts
+// that do not specify a size= mount option. This must be called only once,
+// before any tmpfs filesystems are created.
+func SetDefaultSizeLimit(sizeLimit uint64) {
+	defaultSizeLimit = sizeLimit
+}
+
+func getDefaultSizeLimit(disable bool) uint64 {
+	if disable || defaultSizeLimit == 0 {
+		// The size limit is used to populate statfs(2) results. If Linux tmpfs is
+		// mounted with no size option, then statfs(2) returns f_blocks == f_bfree
+		// == f_bavail == 0. However, many applications treat this as having a size
+		// limit of 0. To work around this, return a very large but non-zero size
+		// limit, chosen to ensure that it does not overflow int64.
+		return math.MaxInt64
+	}
+	return defaultSizeLimit
 }
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, _ string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
-	memFileProvider := pgalloc.MemoryFileProviderFromContext(ctx)
-	if memFileProvider == nil {
+	mfp := pgalloc.MemoryFileProviderFromContext(ctx)
+	if mfp == nil {
 		panic("MemoryFileProviderFromContext returned nil")
 	}
+	mf := mfp.MemoryFile()
+	privateMF := false
 
 	rootFileType := uint16(linux.S_IFDIR)
+	disableDefaultSizeLimit := false
 	newFSType := vfs.FilesystemType(&fstype)
-	tmpfsOpts, ok := opts.InternalData.(FilesystemOpts)
-	if ok {
+
+	// By default we support only "trusted" and "user" namespaces. Linux
+	// also supports "security" and (if configured) POSIX ACL namespaces
+	// "system.posix_acl_access" and "system.posix_acl_default".
+	allowXattrPrefix := map[string]struct{}{
+		linux.XATTR_TRUSTED_PREFIX: struct{}{},
+		linux.XATTR_USER_PREFIX:    struct{}{},
+		// The "security" namespace is allowed, but it always returns an error.
+		linux.XATTR_SECURITY_PREFIX: struct{}{},
+	}
+
+	tmpfsOpts, tmpfsOptsOk := opts.InternalData.(FilesystemOpts)
+	if tmpfsOptsOk {
 		if tmpfsOpts.RootFileType != 0 {
 			rootFileType = tmpfsOpts.RootFileType
 		}
 		if tmpfsOpts.FilesystemType != nil {
 			newFSType = tmpfsOpts.FilesystemType
+		}
+		disableDefaultSizeLimit = tmpfsOpts.DisableDefaultSizeLimit
+		if tmpfsOpts.FilestoreFD != nil {
+			mfOpts := pgalloc.MemoryFileOpts{
+				// tmpfsOpts.FilestoreFD may be backed by a file on disk (not memfd),
+				// which needs to be decommited on destroy to release disk space.
+				DecommitOnDestroy: true,
+				// sentry's seccomp filters don't allow the mmap(2) syscalls that
+				// pgalloc.IMAWorkAroundForMemFile() uses. Users of tmpfsOpts.FilestoreFD
+				// are expected to have performed the work around outside the sandbox.
+				DisableIMAWorkAround: true,
+				// Custom filestore FDs are usually backed by files on disk. Ideally we
+				// would confirm with fstatfs(2) but that is prohibited by seccomp.
+				DiskBackedFile: true,
+			}
+			var err error
+			mf, err = pgalloc.NewMemoryFile(tmpfsOpts.FilestoreFD.ReleaseToFile("overlay-filestore"), mfOpts)
+			if err != nil {
+				ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: pgalloc.NewMemoryFile failed: %v", err)
+				return nil, nil, err
+			}
+			privateMF = true
+		}
+
+		for _, xattr := range tmpfsOpts.AllowXattrPrefix {
+			allowXattrPrefix[xattr] = struct{}{}
 		}
 	}
 
@@ -123,7 +247,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		mode, err := strconv.ParseUint(modeStr, 8, 32)
 		if err != nil {
 			ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: invalid mode: %q", modeStr)
-			return nil, nil, syserror.EINVAL
+			return nil, nil, linuxerr.EINVAL
 		}
 		rootMode = linux.FileMode(mode & 07777)
 	}
@@ -134,12 +258,12 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		uid, err := strconv.ParseUint(uidStr, 10, 32)
 		if err != nil {
 			ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: invalid uid: %q", uidStr)
-			return nil, nil, syserror.EINVAL
+			return nil, nil, linuxerr.EINVAL
 		}
 		kuid := creds.UserNamespace.MapToKUID(auth.UID(uid))
 		if !kuid.Ok() {
 			ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: unmapped uid: %d", uid)
-			return nil, nil, syserror.EINVAL
+			return nil, nil, linuxerr.EINVAL
 		}
 		rootKUID = kuid
 	}
@@ -150,18 +274,36 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		gid, err := strconv.ParseUint(gidStr, 10, 32)
 		if err != nil {
 			ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: invalid gid: %q", gidStr)
-			return nil, nil, syserror.EINVAL
+			return nil, nil, linuxerr.EINVAL
 		}
 		kgid := creds.UserNamespace.MapToKGID(auth.GID(gid))
 		if !kgid.Ok() {
 			ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: unmapped gid: %d", gid)
-			return nil, nil, syserror.EINVAL
+			return nil, nil, linuxerr.EINVAL
 		}
 		rootKGID = kgid
 	}
+	maxSizeInPages := getDefaultSizeLimit(disableDefaultSizeLimit) / hostarch.PageSize
+	maxSizeStr, ok := mopts["size"]
+	if ok {
+		delete(mopts, "size")
+		maxSizeInBytes, err := parseSize(maxSizeStr)
+		if err != nil {
+			ctx.Debugf("tmpfs.FilesystemType.GetFilesystem: parseSize() failed: %v", err)
+			return nil, nil, linuxerr.EINVAL
+		}
+		// Convert size in bytes to nearest Page Size bytes
+		// as Linux allocates memory in terms of Page size.
+		maxSizeInPages, ok = hostarch.ToPagesRoundUp(maxSizeInBytes)
+		if !ok {
+			ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: Pages RoundUp Overflow error: %q", ok)
+			return nil, nil, linuxerr.EINVAL
+		}
+	}
+
 	if len(mopts) != 0 {
 		ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: unknown options: %v", mopts)
-		return nil, nil, syserror.EINVAL
+		return nil, nil, linuxerr.EINVAL
 	}
 
 	devMinor, err := vfsObj.GetAnonBlockDevMinor()
@@ -169,46 +311,108 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, err
 	}
 	clock := time.RealtimeClockFromContext(ctx)
+	memUsage := usage.Tmpfs
+	if tmpfsOpts.Usage != nil {
+		memUsage = *tmpfsOpts.Usage
+	}
 	fs := filesystem{
-		memFile:  memFileProvider.MemoryFile(),
-		clock:    clock,
-		devMinor: devMinor,
+		mf:               mf,
+		privateMF:        privateMF,
+		mfp:              mfp,
+		clock:            clock,
+		devMinor:         devMinor,
+		mopts:            opts.Data,
+		usage:            memUsage,
+		maxFilenameLen:   linux.NAME_MAX,
+		maxSizeInPages:   maxSizeInPages,
+		allowXattrPrefix: allowXattrPrefix,
 	}
 	fs.vfsfs.Init(vfsObj, newFSType, &fs)
+	if tmpfsOptsOk && tmpfsOpts.MaxFilenameLen > 0 {
+		fs.maxFilenameLen = tmpfsOpts.MaxFilenameLen
+	}
 
 	var root *dentry
 	switch rootFileType {
 	case linux.S_IFREG:
-		root = fs.newDentry(fs.newRegularFile(rootKUID, rootKGID, rootMode))
+		root = fs.newDentry(fs.newRegularFile(rootKUID, rootKGID, rootMode, nil /* parentDir */))
 	case linux.S_IFLNK:
-		root = fs.newDentry(fs.newSymlink(rootKUID, rootKGID, rootMode, tmpfsOpts.RootSymlinkTarget))
+		root = fs.newDentry(fs.newSymlink(rootKUID, rootKGID, rootMode, tmpfsOpts.RootSymlinkTarget, nil /* parentDir */))
 	case linux.S_IFDIR:
-		root = &fs.newDirectory(rootKUID, rootKGID, rootMode).dentry
+		root = &fs.newDirectory(rootKUID, rootKGID, rootMode, nil /* parentDir */).dentry
 	default:
-		fs.vfsfs.DecRef()
+		fs.vfsfs.DecRef(ctx)
 		return nil, nil, fmt.Errorf("invalid tmpfs root file type: %#o", rootFileType)
 	}
+	fs.root = root
 	return &fs.vfsfs, &root.vfsd, nil
 }
 
-// NewFilesystem returns a new tmpfs filesystem.
-func NewFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (*vfs.Filesystem, *vfs.Dentry, error) {
-	return FilesystemType{}.GetFilesystem(ctx, vfsObj, creds, "", vfs.GetFilesystemOptions{})
+// Release implements vfs.FilesystemImpl.Release.
+func (fs *filesystem) Release(ctx context.Context) {
+	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
+	fs.mu.Lock()
+	if fs.root.inode.isDir() {
+		fs.root.releaseChildrenLocked(ctx)
+	}
+	fs.mu.Unlock()
+	if fs.privateMF {
+		fs.mf.Destroy()
+	}
 }
 
-// Release implements vfs.FilesystemImpl.Release.
-func (fs *filesystem) Release() {
-	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
+// releaseChildrenLocked is called on the mount point by filesystem.Release() to
+// destroy all objects in the mount. It performs a depth-first walk of the
+// filesystem and "unlinks" everything by decrementing link counts
+// appropriately. There should be no open file descriptors when this is called,
+// so each inode should only have one outstanding reference that is removed once
+// its link count hits zero.
+//
+// Note that we do not update filesystem state precisely while tearing down (for
+// instance, the child maps are ignored)--we only care to remove all remaining
+// references so that every filesystem object gets destroyed. Also note that we
+// do not need to trigger DecRef on the mount point itself or any child mount;
+// these are taken care of by the destructor of the enclosing MountNamespace.
+//
+// Precondition: filesystem.mu is held.
+func (d *dentry) releaseChildrenLocked(ctx context.Context) {
+	dir := d.inode.impl.(*directory)
+	for _, child := range dir.childMap {
+		if child.inode.isDir() {
+			child.releaseChildrenLocked(ctx)
+			child.inode.decLinksLocked(ctx) // link for child/.
+			dir.inode.decLinksLocked(ctx)   // link for child/..
+		}
+		child.inode.decLinksLocked(ctx) // link for child
+	}
+}
+
+func (fs *filesystem) statFS() linux.Statfs {
+	st := linux.Statfs{
+		Type:         linux.TMPFS_MAGIC,
+		BlockSize:    hostarch.PageSize,
+		FragmentSize: hostarch.PageSize,
+		NameLength:   linux.NAME_MAX,
+	}
+
+	// If size is set for tmpfs return set values.
+	st.Blocks = fs.maxSizeInPages
+	pagesUsed := fs.pagesUsed.Load()
+	st.BlocksFree = fs.maxSizeInPages - pagesUsed
+	st.BlocksAvailable = fs.maxSizeInPages - pagesUsed
+	return st
 }
 
 // dentry implements vfs.DentryImpl.
+//
+// +stateify savable
 type dentry struct {
 	vfsd vfs.Dentry
 
 	// parent is this dentry's parent directory. Each referenced dentry holds a
 	// reference on parent.dentry. If this dentry is a filesystem root, parent
 	// is nil. parent is protected by filesystem.mu.
-	parent *dentry
+	parent atomic.Pointer[dentry] `state:".(*dentry)"`
 
 	// name is the name of this dentry in its parent. If this dentry is a
 	// filesystem root, name is the empty string. name is protected by
@@ -249,12 +453,12 @@ func (d *dentry) TryIncRef() bool {
 }
 
 // DecRef implements vfs.DentryImpl.DecRef.
-func (d *dentry) DecRef() {
-	d.inode.decRef()
+func (d *dentry) DecRef(ctx context.Context) {
+	d.inode.decRef(ctx)
 }
 
 // InotifyWithParent implements vfs.DentryImpl.InotifyWithParent.
-func (d *dentry) InotifyWithParent(events, cookie uint32, et vfs.EventType) {
+func (d *dentry) InotifyWithParent(ctx context.Context, events, cookie uint32, et vfs.EventType) {
 	if d.inode.isDir() {
 		events |= linux.IN_ISDIR
 	}
@@ -265,10 +469,11 @@ func (d *dentry) InotifyWithParent(events, cookie uint32, et vfs.EventType) {
 
 	d.inode.fs.mu.RLock()
 	// The ordering below is important, Linux always notifies the parent first.
-	if d.parent != nil {
-		d.parent.inode.watches.Notify(d.name, events, cookie, et, deleted)
+	parent := d.parent.Load()
+	if parent != nil {
+		parent.inode.watches.Notify(ctx, d.name, events, cookie, et, deleted)
 	}
-	d.inode.watches.Notify("", events, cookie, et, deleted)
+	d.inode.watches.Notify(ctx, "", events, cookie, et, deleted)
 	d.inode.fs.mu.RUnlock()
 }
 
@@ -278,20 +483,19 @@ func (d *dentry) Watches() *vfs.Watches {
 }
 
 // OnZeroWatches implements vfs.Dentry.OnZeroWatches.
-func (d *dentry) OnZeroWatches() {}
+func (d *dentry) OnZeroWatches(context.Context) {}
 
 // inode represents a filesystem object.
+//
+// +stateify savable
 type inode struct {
 	// fs is the owning filesystem. fs is immutable.
 	fs *filesystem
 
-	// refs is a reference count. refs is accessed using atomic memory
-	// operations.
-	//
 	// A reference is held on all inodes as long as they are reachable in the
 	// filesystem tree, i.e. nlink is nonzero. This reference is dropped when
 	// nlink reaches 0.
-	refs int64
+	refs inodeRefs
 
 	// xattrs implements extended attributes.
 	//
@@ -300,109 +504,120 @@ type inode struct {
 
 	// Inode metadata. Writing multiple fields atomically requires holding
 	// mu, othewise atomic operations can be used.
-	mu    sync.Mutex
-	mode  uint32 // file type and mode
-	nlink uint32 // protected by filesystem.mu instead of inode.mu
-	uid   uint32 // auth.KUID, but stored as raw uint32 for sync/atomic
-	gid   uint32 // auth.KGID, but ...
-	ino   uint64 // immutable
+	mu    inodeMutex          `state:"nosave"`
+	mode  atomicbitops.Uint32 // file type and mode
+	nlink atomicbitops.Uint32 // protected by filesystem.mu instead of inode.mu
+	uid   atomicbitops.Uint32 // auth.KUID, but stored as raw uint32 for sync/atomic
+	gid   atomicbitops.Uint32 // auth.KGID, but ...
+	ino   uint64              // immutable
 
 	// Linux's tmpfs has no concept of btime.
-	atime int64 // nanoseconds
-	ctime int64 // nanoseconds
-	mtime int64 // nanoseconds
+	atime atomicbitops.Int64 // nanoseconds
+	ctime atomicbitops.Int64 // nanoseconds
+	mtime atomicbitops.Int64 // nanoseconds
 
 	locks vfs.FileLocks
 
 	// Inotify watches for this inode.
 	watches vfs.Watches
 
-	impl interface{} // immutable
+	impl any // immutable
 }
 
 const maxLinks = math.MaxUint32
 
-func (i *inode) init(impl interface{}, fs *filesystem, kuid auth.KUID, kgid auth.KGID, mode linux.FileMode) {
+func (i *inode) init(impl any, fs *filesystem, kuid auth.KUID, kgid auth.KGID, mode linux.FileMode, parentDir *directory) {
 	if mode.FileType() == 0 {
 		panic("file type is required in FileMode")
 	}
+
+	// Inherit the group and setgid bit as in fs/inode.c:inode_init_owner().
+	if parentDir != nil && parentDir.inode.mode.Load()&linux.S_ISGID == linux.S_ISGID {
+		kgid = auth.KGID(parentDir.inode.gid.Load())
+		if mode&linux.S_IFDIR == linux.S_IFDIR {
+			mode |= linux.S_ISGID
+		}
+	}
+
 	i.fs = fs
-	i.refs = 1
-	i.mode = uint32(mode)
-	i.uid = uint32(kuid)
-	i.gid = uint32(kgid)
-	i.ino = atomic.AddUint64(&fs.nextInoMinusOne, 1)
+	i.mode = atomicbitops.FromUint32(uint32(mode))
+	i.uid = atomicbitops.FromUint32(uint32(kuid))
+	i.gid = atomicbitops.FromUint32(uint32(kgid))
+	i.ino = fs.nextInoMinusOne.Add(1)
 	// Tmpfs creation sets atime, ctime, and mtime to current time.
 	now := fs.clock.Now().Nanoseconds()
-	i.atime = now
-	i.ctime = now
-	i.mtime = now
+	i.atime = atomicbitops.FromInt64(now)
+	i.ctime = atomicbitops.FromInt64(now)
+	i.mtime = atomicbitops.FromInt64(now)
 	// i.nlink initialized by caller
 	i.impl = impl
+	i.refs.InitRefs()
 }
 
 // incLinksLocked increments i's link count.
 //
-// Preconditions: filesystem.mu must be locked for writing. i.nlink != 0.
-// i.nlink < maxLinks.
+// Preconditions:
+//   - filesystem.mu must be locked for writing.
+//   - i.mu must be lcoked.
+//   - i.nlink != 0.
+//   - i.nlink < maxLinks.
 func (i *inode) incLinksLocked() {
-	if i.nlink == 0 {
+	if i.nlink.RacyLoad() == 0 {
 		panic("tmpfs.inode.incLinksLocked() called with no existing links")
 	}
-	if i.nlink == maxLinks {
+	if i.nlink.RacyLoad() == maxLinks {
 		panic("tmpfs.inode.incLinksLocked() called with maximum link count")
 	}
-	atomic.AddUint32(&i.nlink, 1)
+	i.nlink.Add(1)
 }
 
 // decLinksLocked decrements i's link count. If the link count reaches 0, we
 // remove a reference on i as well.
 //
-// Preconditions: filesystem.mu must be locked for writing. i.nlink != 0.
-func (i *inode) decLinksLocked() {
-	if i.nlink == 0 {
+// Preconditions:
+//   - filesystem.mu must be locked for writing.
+//   - i.mu must be lcoked.
+//   - i.nlink != 0.
+func (i *inode) decLinksLocked(ctx context.Context) {
+	if i.nlink.RacyLoad() == 0 {
 		panic("tmpfs.inode.decLinksLocked() called with no existing links")
 	}
-	if atomic.AddUint32(&i.nlink, ^uint32(0)) == 0 {
-		i.decRef()
+	if i.nlink.Add(^uint32(0)) == 0 {
+		i.decRef(ctx)
 	}
 }
 
 func (i *inode) incRef() {
-	if atomic.AddInt64(&i.refs, 1) <= 1 {
-		panic("tmpfs.inode.incRef() called without holding a reference")
-	}
+	i.refs.IncRef()
 }
 
 func (i *inode) tryIncRef() bool {
-	for {
-		refs := atomic.LoadInt64(&i.refs)
-		if refs == 0 {
-			return false
-		}
-		if atomic.CompareAndSwapInt64(&i.refs, refs, refs+1) {
-			return true
-		}
-	}
+	return i.refs.TryIncRef()
 }
 
-func (i *inode) decRef() {
-	if refs := atomic.AddInt64(&i.refs, -1); refs == 0 {
-		i.watches.HandleDeletion()
-		if regFile, ok := i.impl.(*regularFile); ok {
+func (i *inode) decRef(ctx context.Context) {
+	i.refs.DecRef(func() {
+		i.watches.HandleDeletion(ctx)
+		// Remove pages used if child being removed is a SymLink or Regular File.
+		switch impl := i.impl.(type) {
+		case *symlink:
+			if len(impl.target) >= shortSymlinkLen {
+				impl.inode.fs.unaccountPages(1)
+			}
+		case *regularFile:
 			// Release memory used by regFile to store data. Since regFile is
 			// no longer usable, we don't need to grab any locks or update any
 			// metadata.
-			regFile.data.DropAll(regFile.memFile)
+			pagesDec := impl.data.DropAll(i.fs.mf)
+			impl.inode.fs.unaccountPages(pagesDec)
 		}
-	} else if refs < 0 {
-		panic("tmpfs.inode.decRef() called without holding a reference")
-	}
+
+	})
 }
 
 func (i *inode) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
-	mode := linux.FileMode(atomic.LoadUint32(&i.mode))
-	return vfs.GenericCheckPermissions(creds, ats, mode, auth.KUID(atomic.LoadUint32(&i.uid)), auth.KGID(atomic.LoadUint32(&i.gid)))
+	mode := linux.FileMode(i.mode.Load())
+	return vfs.GenericCheckPermissions(creds, ats, mode, auth.KUID(i.uid.Load()), auth.KGID(i.gid.Load()))
 }
 
 // Go won't inline this function, and returning linux.Statx (which is quite
@@ -416,27 +631,25 @@ func (i *inode) statTo(stat *linux.Statx) {
 		linux.STATX_UID | linux.STATX_GID | linux.STATX_INO | linux.STATX_SIZE |
 		linux.STATX_BLOCKS | linux.STATX_ATIME | linux.STATX_CTIME |
 		linux.STATX_MTIME
-	stat.Blksize = usermem.PageSize
-	stat.Nlink = atomic.LoadUint32(&i.nlink)
-	stat.UID = atomic.LoadUint32(&i.uid)
-	stat.GID = atomic.LoadUint32(&i.gid)
-	stat.Mode = uint16(atomic.LoadUint32(&i.mode))
+	stat.Blksize = hostarch.PageSize
+	stat.Nlink = i.nlink.Load()
+	stat.UID = i.uid.Load()
+	stat.GID = i.gid.Load()
+	stat.Mode = uint16(i.mode.Load())
 	stat.Ino = i.ino
-	stat.Atime = linux.NsecToStatxTimestamp(i.atime)
-	stat.Ctime = linux.NsecToStatxTimestamp(i.ctime)
-	stat.Mtime = linux.NsecToStatxTimestamp(i.mtime)
+	stat.Atime = linux.NsecToStatxTimestamp(i.atime.Load())
+	stat.Ctime = linux.NsecToStatxTimestamp(i.ctime.Load())
+	stat.Mtime = linux.NsecToStatxTimestamp(i.mtime.Load())
 	stat.DevMajor = linux.UNNAMED_MAJOR
 	stat.DevMinor = i.fs.devMinor
 	switch impl := i.impl.(type) {
 	case *regularFile:
-		stat.Mask |= linux.STATX_SIZE | linux.STATX_BLOCKS
-		stat.Size = uint64(atomic.LoadUint64(&impl.size))
+		stat.Size = uint64(impl.size.Load())
 		// TODO(jamieliu): This should be impl.data.Span() / 512, but this is
 		// too expensive to compute here. Cache it in regularFile.
 		stat.Blocks = allocatedBlocksForSize(stat.Size)
 	case *directory:
-		// "20" is mm/shmem.c:BOGO_DIRENT_SIZE.
-		stat.Size = 20 * (2 + uint64(atomic.LoadInt64(&impl.numChildren)))
+		stat.Size = direntSize * (2 + uint64(impl.numChildren.Load()))
 		// stat.Blocks is 0.
 	case *symlink:
 		stat.Size = uint64(len(impl.target))
@@ -452,37 +665,27 @@ func (i *inode) statTo(stat *linux.Statx) {
 	}
 }
 
-func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, stat *linux.Statx) error {
+func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs.SetStatOptions) error {
+	stat := &opts.Stat
 	if stat.Mask == 0 {
 		return nil
 	}
 	if stat.Mask&^(linux.STATX_MODE|linux.STATX_UID|linux.STATX_GID|linux.STATX_ATIME|linux.STATX_MTIME|linux.STATX_CTIME|linux.STATX_SIZE) != 0 {
-		return syserror.EPERM
+		return linuxerr.EPERM
 	}
-	mode := linux.FileMode(atomic.LoadUint32(&i.mode))
-	if err := vfs.CheckSetStat(ctx, creds, stat, mode, auth.KUID(atomic.LoadUint32(&i.uid)), auth.KGID(atomic.LoadUint32(&i.gid))); err != nil {
+	mode := linux.FileMode(i.mode.Load())
+	if err := vfs.CheckSetStat(ctx, creds, opts, mode, auth.KUID(i.uid.Load()), auth.KGID(i.gid.Load())); err != nil {
 		return err
 	}
+
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	var (
 		needsMtimeBump bool
 		needsCtimeBump bool
 	)
+	clearSID := false
 	mask := stat.Mask
-	if mask&linux.STATX_MODE != 0 {
-		ft := atomic.LoadUint32(&i.mode) & linux.S_IFMT
-		atomic.StoreUint32(&i.mode, ft|uint32(stat.Mode&^linux.S_IFMT))
-		needsCtimeBump = true
-	}
-	if mask&linux.STATX_UID != 0 {
-		atomic.StoreUint32(&i.uid, stat.UID)
-		needsCtimeBump = true
-	}
-	if mask&linux.STATX_GID != 0 {
-		atomic.StoreUint32(&i.gid, stat.GID)
-		needsCtimeBump = true
-	}
 	if mask&linux.STATX_SIZE != 0 {
 		switch impl := i.impl.(type) {
 		case *regularFile:
@@ -491,29 +694,55 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, stat *linu
 				return err
 			}
 			if updated {
+				clearSID = true
 				needsMtimeBump = true
 				needsCtimeBump = true
 			}
 		case *directory:
-			return syserror.EISDIR
+			return linuxerr.EISDIR
 		default:
-			return syserror.EINVAL
+			return linuxerr.EINVAL
 		}
+	}
+	if mask&linux.STATX_UID != 0 {
+		i.uid.Store(stat.UID)
+		needsCtimeBump = true
+		clearSID = true
+	}
+	if mask&linux.STATX_GID != 0 {
+		i.gid.Store(stat.GID)
+		needsCtimeBump = true
+		clearSID = true
+	}
+	if mask&linux.STATX_MODE != 0 {
+		for {
+			old := i.mode.Load()
+			ft := old & linux.S_IFMT
+			newMode := ft | uint32(stat.Mode & ^uint16(linux.S_IFMT))
+			if clearSID {
+				newMode = vfs.ClearSUIDAndSGID(newMode)
+			}
+			if swapped := i.mode.CompareAndSwap(old, newMode); swapped {
+				clearSID = false
+				break
+			}
+		}
+		needsCtimeBump = true
 	}
 	now := i.fs.clock.Now().Nanoseconds()
 	if mask&linux.STATX_ATIME != 0 {
 		if stat.Atime.Nsec == linux.UTIME_NOW {
-			atomic.StoreInt64(&i.atime, now)
+			i.atime.Store(now)
 		} else {
-			atomic.StoreInt64(&i.atime, stat.Atime.ToNsecCapped())
+			i.atime.Store(stat.Atime.ToNsecCapped())
 		}
 		needsCtimeBump = true
 	}
 	if mask&linux.STATX_MTIME != 0 {
 		if stat.Mtime.Nsec == linux.UTIME_NOW {
-			atomic.StoreInt64(&i.mtime, now)
+			i.mtime.Store(now)
 		} else {
-			atomic.StoreInt64(&i.mtime, stat.Mtime.ToNsecCapped())
+			i.mtime.Store(stat.Mtime.ToNsecCapped())
 		}
 		needsCtimeBump = true
 		// Ignore the mtime bump, since we just set it ourselves.
@@ -521,18 +750,32 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, stat *linu
 	}
 	if mask&linux.STATX_CTIME != 0 {
 		if stat.Ctime.Nsec == linux.UTIME_NOW {
-			atomic.StoreInt64(&i.ctime, now)
+			i.ctime.Store(now)
 		} else {
-			atomic.StoreInt64(&i.ctime, stat.Ctime.ToNsecCapped())
+			i.ctime.Store(stat.Ctime.ToNsecCapped())
 		}
 		// Ignore the ctime bump, since we just set it ourselves.
 		needsCtimeBump = false
 	}
+
+	// We may have to clear the SUID/SGID bits, but didn't do so as part of
+	// STATX_MODE.
+	if clearSID {
+		for {
+			old := i.mode.Load()
+			newMode := vfs.ClearSUIDAndSGID(old)
+			if swapped := i.mode.CompareAndSwap(old, newMode); swapped {
+				break
+			}
+		}
+		needsCtimeBump = true
+	}
+
 	if needsMtimeBump {
-		atomic.StoreInt64(&i.mtime, now)
+		i.mtime.Store(now)
 	}
 	if needsCtimeBump {
-		atomic.StoreInt64(&i.ctime, now)
+		i.ctime.Store(now)
 	}
 
 	return nil
@@ -557,6 +800,8 @@ func (i *inode) direntType() uint8 {
 		return linux.DT_LNK
 	case *socketFile:
 		return linux.DT_SOCK
+	case *namedPipe:
+		return linux.DT_FIFO
 	case *deviceFile:
 		switch impl.kind {
 		case vfs.BlockDevice:
@@ -572,7 +817,8 @@ func (i *inode) direntType() uint8 {
 }
 
 func (i *inode) isDir() bool {
-	return linux.FileMode(i.mode).FileType() == linux.S_IFDIR
+	mode := linux.FileMode(i.mode.Load())
+	return mode.FileType() == linux.S_IFDIR
 }
 
 func (i *inode) touchAtime(mnt *vfs.Mount) {
@@ -584,7 +830,7 @@ func (i *inode) touchAtime(mnt *vfs.Mount) {
 	}
 	now := i.fs.clock.Now().Nanoseconds()
 	i.mu.Lock()
-	atomic.StoreInt64(&i.atime, now)
+	i.atime.Store(now)
 	i.mu.Unlock()
 	mnt.EndWrite()
 }
@@ -593,7 +839,7 @@ func (i *inode) touchAtime(mnt *vfs.Mount) {
 func (i *inode) touchCtime() {
 	now := i.fs.clock.Now().Nanoseconds()
 	i.mu.Lock()
-	atomic.StoreInt64(&i.ctime, now)
+	i.ctime.Store(now)
 	i.mu.Unlock()
 }
 
@@ -601,71 +847,76 @@ func (i *inode) touchCtime() {
 func (i *inode) touchCMtime() {
 	now := i.fs.clock.Now().Nanoseconds()
 	i.mu.Lock()
-	atomic.StoreInt64(&i.mtime, now)
-	atomic.StoreInt64(&i.ctime, now)
+	i.mtime.Store(now)
+	i.ctime.Store(now)
 	i.mu.Unlock()
 }
 
-// Preconditions: The caller has called vfs.Mount.CheckBeginWrite() and holds
-// inode.mu.
+// Preconditions:
+//   - The caller has called vfs.Mount.CheckBeginWrite().
+//   - inode.mu must be locked.
 func (i *inode) touchCMtimeLocked() {
 	now := i.fs.clock.Now().Nanoseconds()
-	atomic.StoreInt64(&i.mtime, now)
-	atomic.StoreInt64(&i.ctime, now)
+	i.mtime.Store(now)
+	i.ctime.Store(now)
 }
 
-func (i *inode) listxattr(size uint64) ([]string, error) {
-	return i.xattrs.Listxattr(size)
+func (i *inode) checkXattrPrefix(name string) error {
+	for prefix := range i.fs.allowXattrPrefix {
+		if strings.HasPrefix(name, prefix) {
+			return nil
+		}
+	}
+	return linuxerr.EOPNOTSUPP
 }
 
-func (i *inode) getxattr(creds *auth.Credentials, opts *vfs.GetxattrOptions) (string, error) {
-	if err := i.checkPermissions(creds, vfs.MayRead); err != nil {
+func (i *inode) listXattr(creds *auth.Credentials, size uint64) ([]string, error) {
+	return i.xattrs.ListXattr(creds, size)
+}
+
+func (i *inode) getXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions) (string, error) {
+	if err := i.checkXattrPrefix(opts.Name); err != nil {
 		return "", err
 	}
-	if !strings.HasPrefix(opts.Name, linux.XATTR_USER_PREFIX) {
-		return "", syserror.EOPNOTSUPP
+	mode := linux.FileMode(i.mode.Load())
+	kuid := auth.KUID(i.uid.Load())
+	kgid := auth.KGID(i.gid.Load())
+	if err := vfs.GenericCheckPermissions(creds, vfs.MayRead, mode, kuid, kgid); err != nil {
+		return "", err
 	}
-	if !i.userXattrSupported() {
-		return "", syserror.ENODATA
-	}
-	return i.xattrs.Getxattr(opts)
+	return i.xattrs.GetXattr(creds, mode, kuid, opts)
 }
 
-func (i *inode) setxattr(creds *auth.Credentials, opts *vfs.SetxattrOptions) error {
-	if err := i.checkPermissions(creds, vfs.MayWrite); err != nil {
+func (i *inode) setXattr(creds *auth.Credentials, opts *vfs.SetXattrOptions) error {
+	if err := i.checkXattrPrefix(opts.Name); err != nil {
 		return err
 	}
-	if !strings.HasPrefix(opts.Name, linux.XATTR_USER_PREFIX) {
-		return syserror.EOPNOTSUPP
-	}
-	if !i.userXattrSupported() {
-		return syserror.EPERM
-	}
-	return i.xattrs.Setxattr(opts)
-}
-
-func (i *inode) removexattr(creds *auth.Credentials, name string) error {
-	if err := i.checkPermissions(creds, vfs.MayWrite); err != nil {
+	mode := linux.FileMode(i.mode.Load())
+	kuid := auth.KUID(i.uid.Load())
+	kgid := auth.KGID(i.gid.Load())
+	if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, kuid, kgid); err != nil {
 		return err
 	}
-	if !strings.HasPrefix(name, linux.XATTR_USER_PREFIX) {
-		return syserror.EOPNOTSUPP
-	}
-	if !i.userXattrSupported() {
-		return syserror.EPERM
-	}
-	return i.xattrs.Removexattr(name)
+	return i.xattrs.SetXattr(creds, mode, kuid, opts)
 }
 
-// Extended attributes in the user.* namespace are only supported for regular
-// files and directories.
-func (i *inode) userXattrSupported() bool {
-	filetype := linux.S_IFMT & atomic.LoadUint32(&i.mode)
-	return filetype == linux.S_IFREG || filetype == linux.S_IFDIR
+func (i *inode) removeXattr(creds *auth.Credentials, name string) error {
+	if err := i.checkXattrPrefix(name); err != nil {
+		return err
+	}
+	mode := linux.FileMode(i.mode.Load())
+	kuid := auth.KUID(i.uid.Load())
+	kgid := auth.KGID(i.gid.Load())
+	if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, kuid, kgid); err != nil {
+		return err
+	}
+	return i.xattrs.RemoveXattr(creds, mode, kuid, name)
 }
 
 // fileDescription is embedded by tmpfs implementations of
 // vfs.FileDescriptionImpl.
+//
+// +stateify savable
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -693,95 +944,76 @@ func (fd *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linu
 
 // SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
-	creds := auth.CredentialsFromContext(ctx)
-	d := fd.dentry()
-	if err := d.inode.setStat(ctx, creds, &opts.Stat); err != nil {
-		return err
-	}
-
-	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
-		d.InotifyWithParent(ev, 0, vfs.InodeEvent)
-	}
-	return nil
+	return fd.dentry().inode.setStat(ctx, auth.CredentialsFromContext(ctx), &opts)
 }
 
-// Listxattr implements vfs.FileDescriptionImpl.Listxattr.
-func (fd *fileDescription) Listxattr(ctx context.Context, size uint64) ([]string, error) {
-	return fd.inode().listxattr(size)
+// StatFS implements vfs.FileDescriptionImpl.StatFS.
+func (fd *fileDescription) StatFS(ctx context.Context) (linux.Statfs, error) {
+	return fd.filesystem().statFS(), nil
 }
 
-// Getxattr implements vfs.FileDescriptionImpl.Getxattr.
-func (fd *fileDescription) Getxattr(ctx context.Context, opts vfs.GetxattrOptions) (string, error) {
-	return fd.inode().getxattr(auth.CredentialsFromContext(ctx), &opts)
+// ListXattr implements vfs.FileDescriptionImpl.ListXattr.
+func (fd *fileDescription) ListXattr(ctx context.Context, size uint64) ([]string, error) {
+	return fd.inode().listXattr(auth.CredentialsFromContext(ctx), size)
 }
 
-// Setxattr implements vfs.FileDescriptionImpl.Setxattr.
-func (fd *fileDescription) Setxattr(ctx context.Context, opts vfs.SetxattrOptions) error {
-	d := fd.dentry()
-	if err := d.inode.setxattr(auth.CredentialsFromContext(ctx), &opts); err != nil {
-		return err
-	}
-
-	// Generate inotify events.
-	d.InotifyWithParent(linux.IN_ATTRIB, 0, vfs.InodeEvent)
-	return nil
+// GetXattr implements vfs.FileDescriptionImpl.GetXattr.
+func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string, error) {
+	return fd.inode().getXattr(auth.CredentialsFromContext(ctx), &opts)
 }
 
-// Removexattr implements vfs.FileDescriptionImpl.Removexattr.
-func (fd *fileDescription) Removexattr(ctx context.Context, name string) error {
-	d := fd.dentry()
-	if err := d.inode.removexattr(auth.CredentialsFromContext(ctx), name); err != nil {
-		return err
-	}
-
-	// Generate inotify events.
-	d.InotifyWithParent(linux.IN_ATTRIB, 0, vfs.InodeEvent)
-	return nil
+// SetXattr implements vfs.FileDescriptionImpl.SetXattr.
+func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
+	return fd.dentry().inode.setXattr(auth.CredentialsFromContext(ctx), &opts)
 }
 
-// NewMemfd creates a new tmpfs regular file and file description that can back
-// an anonymous fd created by memfd_create.
-func NewMemfd(mount *vfs.Mount, creds *auth.Credentials, allowSeals bool, name string) (*vfs.FileDescription, error) {
-	fs, ok := mount.Filesystem().Impl().(*filesystem)
-	if !ok {
-		panic("NewMemfd() called with non-tmpfs mount")
-	}
-
-	// Per Linux, mm/shmem.c:__shmem_file_setup(), memfd inodes are set up with
-	// S_IRWXUGO.
-	inode := fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, 0777)
-	rf := inode.impl.(*regularFile)
-	if allowSeals {
-		rf.seals = 0
-	}
-
-	d := fs.newDentry(inode)
-	defer d.DecRef()
-	d.name = name
-
-	// Per Linux, mm/shmem.c:__shmem_file_setup(), memfd files are set up with
-	// FMODE_READ | FMODE_WRITE.
-	var fd regularFileFD
-	fd.Init(&inode.locks)
-	flags := uint32(linux.O_RDWR)
-	if err := fd.vfsfd.Init(&fd, flags, mount, &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
-		return nil, err
-	}
-	return &fd.vfsfd, nil
-}
-
-// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
-	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
-}
-
-// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
-func (fd *fileDescription) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
-	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
+// RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
+func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
+	return fd.dentry().inode.removeXattr(auth.CredentialsFromContext(ctx), name)
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync. It does nothing because all
 // filesystem state is in-memory.
 func (*fileDescription) Sync(context.Context) error {
 	return nil
+}
+
+// parseSize converts size in string to an integer bytes.
+// Supported suffixes in string are:K, M, G, T, P, E.
+func parseSize(s string) (uint64, error) {
+	if len(s) == 0 {
+		return 0, fmt.Errorf("size parameter empty")
+	}
+	suffix := s[len(s)-1]
+	count := 1
+	switch suffix {
+	case 'e', 'E':
+		count = count << 10
+		fallthrough
+	case 'p', 'P':
+		count = count << 10
+		fallthrough
+	case 't', 'T':
+		count = count << 10
+		fallthrough
+	case 'g', 'G':
+		count = count << 10
+		fallthrough
+	case 'm', 'M':
+		count = count << 10
+		fallthrough
+	case 'k', 'K':
+		count = count << 10
+		s = s[:len(s)-1]
+	}
+	byteTmp, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, linuxerr.EINVAL
+	}
+	// Check for overflow.
+	bytes := byteTmp * uint64(count)
+	if byteTmp != 0 && bytes/byteTmp != uint64(count) {
+		return 0, fmt.Errorf("size overflow")
+	}
+	return bytes, err
 }

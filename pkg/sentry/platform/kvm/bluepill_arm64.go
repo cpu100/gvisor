@@ -12,32 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build arm64
 // +build arm64
 
 package kvm
 
 import (
-	"syscall"
-
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
 )
 
 var (
 	// The action for bluepillSignal is changed by sigaction().
-	bluepillSignal = syscall.SIGILL
-
-	// vcpuSErr is the event of system error.
-	vcpuSErr = kvmVcpuEvents{
-		exception: exception{
-			sErrPending: 1,
-			sErrHasEsr:  0,
-			pad:         [6]uint8{0, 0, 0, 0, 0, 0},
-			sErrEsr:     1,
-		},
-		rsvd: [12]uint32{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-	}
+	bluepillSignal = unix.SIGILL
 )
+
+// getTLS returns the value of TPIDR_EL0 register.
+//
+//go:nosplit
+func getTLS() (value uint64)
+
+// setTLS writes the TPIDR_EL0 value.
+//
+//go:nosplit
+func setTLS(value uint64)
 
 // bluepillArchEnter is called during bluepillEnter.
 //
@@ -49,8 +48,10 @@ func bluepillArchEnter(context *arch.SignalContext64) (c *vCPU) {
 	regs.Sp = context.Sp
 	regs.Pc = context.Pc
 	regs.Pstate = context.Pstate
-	regs.Pstate &^= uint64(ring0.KernelFlagsClear)
+	regs.Pstate &^= uint64(ring0.PsrFlagsClear)
 	regs.Pstate |= ring0.KernelFlagsSet
+	regs.TPIDR_EL0 = getTLS()
+
 	return
 }
 
@@ -63,12 +64,13 @@ func bluepillArchExit(c *vCPU, context *arch.SignalContext64) {
 	context.Sp = regs.Sp
 	context.Pc = regs.Pc
 	context.Pstate = regs.Pstate
-	context.Pstate &^= uint64(ring0.UserFlagsClear)
+	context.Pstate &^= uint64(ring0.PsrFlagsClear)
 	context.Pstate |= ring0.UserFlagsSet
+	setTLS(regs.TPIDR_EL0)
 
 	lazyVfp := c.GetLazyVFP()
 	if lazyVfp != 0 {
-		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
+		fpsimd := fpsimdPtr(c.FloatingPointState().BytePointer()) // escapes: no
 		context.Fpsimd64.Fpsr = fpsimd.Fpsr
 		context.Fpsimd64.Fpcr = fpsimd.Fpcr
 		context.Fpsimd64.Vregs = fpsimd.Vregs
@@ -86,14 +88,14 @@ func (c *vCPU) KernelSyscall() {
 		regs.Pc -= 4 // Rewind.
 	}
 
-	vfpEnable := ring0.CPACREL1()
-	if vfpEnable != 0 {
-		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
+	fpDisableTrap := ring0.CPACREL1()
+	if fpDisableTrap != 0 {
+		fpsimd := fpsimdPtr(c.FloatingPointState().BytePointer()) // escapes: no
 		fpcr := ring0.GetFPCR()
 		fpsr := ring0.GetFPSR()
 		fpsimd.Fpcr = uint32(fpcr)
 		fpsimd.Fpsr = uint32(fpsr)
-		ring0.SaveVRegs((*byte)(c.floatingPointState))
+		ring0.SaveVRegs(c.FloatingPointState().BytePointer()) // escapes: no
 	}
 
 	ring0.Halt()
@@ -110,15 +112,21 @@ func (c *vCPU) KernelException(vector ring0.Vector) {
 		regs.Pc = 0
 	}
 
-	vfpEnable := ring0.CPACREL1()
-	if vfpEnable != 0 {
-		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
+	fpDisableTrap := ring0.CPACREL1()
+	if fpDisableTrap != 0 {
+		fpsimd := fpsimdPtr(c.FloatingPointState().BytePointer()) // escapes: no
 		fpcr := ring0.GetFPCR()
 		fpsr := ring0.GetFPSR()
 		fpsimd.Fpcr = uint32(fpcr)
 		fpsimd.Fpsr = uint32(fpsr)
-		ring0.SaveVRegs((*byte)(c.floatingPointState))
+		ring0.SaveVRegs(c.FloatingPointState().BytePointer()) // escapes: no
 	}
 
 	ring0.Halt()
+}
+
+// hltSanityCheck verifies the current state to detect obvious corruption.
+//
+//go:nosplit
+func (c *vCPU) hltSanityCheck() {
 }

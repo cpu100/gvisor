@@ -16,35 +16,19 @@ package tcp
 
 import (
 	"fmt"
-	"sync/atomic"
-	"time"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/ports"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
-
-func (e *endpoint) drainSegmentLocked() {
-	// Drain only up to once.
-	if e.drainDone != nil {
-		return
-	}
-
-	e.drainDone = make(chan struct{})
-	e.undrain = make(chan struct{})
-	e.mu.Unlock()
-
-	e.notifyProtocolGoroutine(notifyDrain)
-	<-e.drainDone
-
-	e.mu.Lock()
-}
 
 // beforeSave is invoked by stateify.
 func (e *endpoint) beforeSave() {
 	// Stop incoming packets.
-	e.segmentQueue.setLimit(0)
+	e.segmentQueue.freeze()
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -53,79 +37,40 @@ func (e *endpoint) beforeSave() {
 	switch {
 	case epState == StateInitial || epState == StateBound:
 	case epState.connected() || epState.handshake():
-		if e.route.Capabilities()&stack.CapabilitySaveRestore == 0 {
-			if e.route.Capabilities()&stack.CapabilityDisconnectOk == 0 {
-				panic(tcpip.ErrSaveRejection{fmt.Errorf("endpoint cannot be saved in connected state: local %v:%d, remote %v:%d", e.ID.LocalAddress, e.ID.LocalPort, e.ID.RemoteAddress, e.ID.RemotePort)})
+		if !e.route.HasSaveRestoreCapability() {
+			if !e.route.HasDisconnectOkCapability() {
+				panic(&tcpip.ErrSaveRejection{
+					Err: fmt.Errorf("endpoint cannot be saved in connected state: local %s:%d, remote %s:%d", e.TransportEndpointInfo.ID.LocalAddress, e.TransportEndpointInfo.ID.LocalPort, e.TransportEndpointInfo.ID.RemoteAddress, e.TransportEndpointInfo.ID.RemotePort),
+				})
 			}
-			e.resetConnectionLocked(tcpip.ErrConnectionAborted)
+			e.resetConnectionLocked(&tcpip.ErrConnectionAborted{})
 			e.mu.Unlock()
 			e.Close()
 			e.mu.Lock()
 		}
-		if !e.workerRunning {
-			// The endpoint must be in acceptedChan or has been just
-			// disconnected and closed.
-			break
-		}
 		fallthrough
-	case epState == StateListen || epState == StateConnecting:
-		e.drainSegmentLocked()
-		// Refresh epState, since drainSegmentLocked may have changed it.
-		epState = e.EndpointState()
-		if !epState.closed() {
-			if !e.workerRunning {
-				panic("endpoint has no worker running in listen, connecting, or connected state")
-			}
-		}
+	case epState == StateListen:
+		// Nothing to do.
 	case epState.closed():
-		for e.workerRunning {
-			e.mu.Unlock()
-			time.Sleep(100 * time.Millisecond)
-			e.mu.Lock()
-		}
-		if e.workerRunning {
-			panic(fmt.Sprintf("endpoint: %+v still has worker running in closed or error state", e.ID))
-		}
+		// Nothing to do.
 	default:
 		panic(fmt.Sprintf("endpoint in unknown state %v", e.EndpointState()))
 	}
-
-	if e.waiterQueue != nil && !e.waiterQueue.IsEmpty() {
-		panic("endpoint still has waiters upon save")
-	}
 }
 
-// saveAcceptedChan is invoked by stateify.
-func (e *endpoint) saveAcceptedChan() []*endpoint {
-	if e.acceptedChan == nil {
-		return nil
-	}
-	acceptedEndpoints := make([]*endpoint, len(e.acceptedChan), cap(e.acceptedChan))
-	for i := 0; i < len(acceptedEndpoints); i++ {
-		select {
-		case ep := <-e.acceptedChan:
-			acceptedEndpoints[i] = ep
-		default:
-			panic("endpoint acceptedChan buffer got consumed by background context")
-		}
-	}
-	for i := 0; i < len(acceptedEndpoints); i++ {
-		select {
-		case e.acceptedChan <- acceptedEndpoints[i]:
-		default:
-			panic("endpoint acceptedChan buffer got populated by background context")
-		}
+// saveEndpoints is invoked by stateify.
+func (a *acceptQueue) saveEndpoints() []*endpoint {
+	acceptedEndpoints := make([]*endpoint, a.endpoints.Len())
+	for i, e := 0, a.endpoints.Front(); e != nil; i, e = i+1, e.Next() {
+		acceptedEndpoints[i] = e.Value.(*endpoint)
 	}
 	return acceptedEndpoints
 }
 
-// loadAcceptedChan is invoked by stateify.
-func (e *endpoint) loadAcceptedChan(acceptedEndpoints []*endpoint) {
-	if cap(acceptedEndpoints) > 0 {
-		e.acceptedChan = make(chan *endpoint, cap(acceptedEndpoints))
-		for _, ep := range acceptedEndpoints {
-			e.acceptedChan <- ep
-		}
+// loadEndpoints is invoked by stateify.
+func (a *acceptQueue) loadEndpoints(acceptedEndpoints []*endpoint) {
+	for _, ep := range acceptedEndpoints {
+		a.endpoints.PushBack(ep)
 	}
 }
 
@@ -160,49 +105,51 @@ func (e *endpoint) loadState(epState EndpointState) {
 	// Directly update the state here rather than using e.setEndpointState
 	// as the endpoint is still being loaded and the stack reference is not
 	// yet initialized.
-	atomic.StoreUint32((*uint32)(&e.state), uint32(epState))
+	e.state.Store(uint32(epState))
 }
 
 // afterLoad is invoked by stateify.
 func (e *endpoint) afterLoad() {
-	e.origEndpointState = e.state
+	// RacyLoad() can be used because we are initializing e.
+	e.origEndpointState = e.state.RacyLoad()
 	// Restore the endpoint to InitialState as it will be moved to
 	// its origEndpointState during Resume.
-	e.state = StateInitial
-	// Condition variables and mutexs are not S/R'ed so reinitialize
-	// acceptCond with e.acceptMu.
-	e.acceptCond = sync.NewCond(&e.acceptMu)
+	e.state = atomicbitops.FromUint32(uint32(StateInitial))
 	stack.StackFromEnv.RegisterRestoredEndpoint(e)
 }
 
 // Resume implements tcpip.ResumableEndpoint.Resume.
 func (e *endpoint) Resume(s *stack.Stack) {
-	e.stack = s
-	e.segmentQueue.setLimit(MaxUnprocessedSegments)
-	epState := e.origEndpointState
-	switch epState {
-	case StateInitial, StateBound, StateListen, StateConnecting, StateEstablished:
-		var ss SendBufferSizeOption
-		if err := e.stack.TransportProtocolOption(ProtocolNumber, &ss); err == nil {
-			if e.sndBufSize < ss.Min || e.sndBufSize > ss.Max {
-				panic(fmt.Sprintf("endpoint.sndBufSize %d is outside the min and max allowed [%d, %d]", e.sndBufSize, ss.Min, ss.Max))
-			}
-		}
-
-		var rs ReceiveBufferSizeOption
-		if err := e.stack.TransportProtocolOption(ProtocolNumber, &rs); err == nil {
-			if e.rcvBufSize < rs.Min || e.rcvBufSize > rs.Max {
-				panic(fmt.Sprintf("endpoint.rcvBufSize %d is outside the min and max allowed [%d, %d]", e.rcvBufSize, rs.Min, rs.Max))
-			}
-		}
+	if !e.EndpointState().closed() {
+		e.keepalive.timer.init(s.Clock(), maybeFailTimerHandler(e, e.keepaliveTimerExpired))
 	}
+	if snd := e.snd; snd != nil {
+		snd.resendTimer.init(s.Clock(), maybeFailTimerHandler(e, e.snd.retransmitTimerExpired))
+		snd.reorderTimer.init(s.Clock(), timerHandler(e, e.snd.rc.reorderTimerExpired))
+		snd.probeTimer.init(s.Clock(), timerHandler(e, e.snd.probeTimerExpired))
+	}
+	e.stack = s
+	e.protocol = protocolFromStack(s)
+	e.ops.InitHandler(e, e.stack, GetTCPSendBufferLimits, GetTCPReceiveBufferLimits)
+	e.segmentQueue.thaw()
 
 	bind := func() {
-		addr, _, err := e.checkV4MappedLocked(tcpip.FullAddress{Addr: e.BindAddr, Port: e.ID.LocalPort})
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		addr, _, err := e.checkV4MappedLocked(tcpip.FullAddress{Addr: e.BindAddr, Port: e.TransportEndpointInfo.ID.LocalPort})
 		if err != nil {
 			panic("unable to parse BindAddr: " + err.String())
 		}
-		if ok := e.stack.ReserveTuple(e.effectiveNetProtos, ProtocolNumber, addr.Addr, addr.Port, e.boundPortFlags, e.boundBindToDevice, e.boundDest); !ok {
+		portRes := ports.Reservation{
+			Networks:     e.effectiveNetProtos,
+			Transport:    ProtocolNumber,
+			Addr:         addr.Addr,
+			Port:         addr.Port,
+			Flags:        e.boundPortFlags,
+			BindToDevice: e.boundBindToDevice,
+			Dest:         e.boundDest,
+		}
+		if ok := e.stack.ReserveTuple(portRes); !ok {
 			panic(fmt.Sprintf("unable to re-reserve tuple (%v, %q, %d, %+v, %d, %v)", e.effectiveNetProtos, addr.Addr, addr.Port, e.boundPortFlags, e.boundBindToDevice, e.boundDest))
 		}
 		e.isPortReserved = true
@@ -211,42 +158,51 @@ func (e *endpoint) Resume(s *stack.Stack) {
 		e.setEndpointState(StateBound)
 	}
 
+	epState := EndpointState(e.origEndpointState)
 	switch {
 	case epState.connected():
 		bind()
-		if len(e.connectingAddress) == 0 {
-			e.connectingAddress = e.ID.RemoteAddress
+		if e.connectingAddress.BitLen() == 0 {
+			e.connectingAddress = e.TransportEndpointInfo.ID.RemoteAddress
 			// This endpoint is accepted by netstack but not yet by
 			// the app. If the endpoint is IPv6 but the remote
 			// address is IPv4, we need to connect as IPv6 so that
 			// dual-stack mode can be properly activated.
-			if e.NetProto == header.IPv6ProtocolNumber && len(e.ID.RemoteAddress) != header.IPv6AddressSize {
-				e.connectingAddress = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff" + e.ID.RemoteAddress
+			if e.NetProto == header.IPv6ProtocolNumber && e.TransportEndpointInfo.ID.RemoteAddress.BitLen() != header.IPv6AddressSizeBits {
+				e.connectingAddress = tcpip.AddrFrom16Slice(append(
+					[]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff},
+					e.TransportEndpointInfo.ID.RemoteAddress.AsSlice()...,
+				))
 			}
 		}
 		// Reset the scoreboard to reinitialize the sack information as
 		// we do not restore SACK information.
 		e.scoreboard.Reset()
-		if err := e.connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.ID.RemotePort}, false, e.workerRunning); err != tcpip.ErrConnectStarted {
+		e.mu.Lock()
+		err := e.connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.TransportEndpointInfo.ID.RemotePort}, false /* handshake */)
+		if _, ok := err.(*tcpip.ErrConnectStarted); !ok {
 			panic("endpoint connecting failed: " + err.String())
 		}
-		e.mu.Lock()
-		e.state = e.origEndpointState
-		closed := e.closed
-		e.mu.Unlock()
-		e.notifyProtocolGoroutine(notifyTickleWorker)
-		if epState == StateFinWait2 && closed {
-			// If the endpoint has been closed then make sure we notify so
-			// that the FIN_WAIT2 timer is started after a restore.
-			e.notifyProtocolGoroutine(notifyClose)
+		e.state.Store(e.origEndpointState)
+		// For FIN-WAIT-2 and TIME-WAIT we need to start the appropriate timers so
+		// that the socket is closed correctly.
+		switch epState {
+		case StateFinWait2:
+			e.finWait2Timer = e.stack.Clock().AfterFunc(e.tcpLingerTimeout, e.finWait2TimerExpired)
+		case StateTimeWait:
+			e.timeWaitTimer = e.stack.Clock().AfterFunc(e.getTimeWaitDuration(), e.timeWaitTimerExpired)
 		}
+
+		e.mu.Unlock()
 		connectedLoading.Done()
 	case epState == StateListen:
 		tcpip.AsyncLoading.Add(1)
 		go func() {
 			connectedLoading.Wait()
 			bind()
-			backlog := cap(e.acceptedChan)
+			e.acceptMu.Lock()
+			backlog := e.acceptQueue.capacity
+			e.acceptMu.Unlock()
 			if err := e.Listen(backlog); err != nil {
 				panic("endpoint listening failed: " + err.String())
 			}
@@ -258,18 +214,41 @@ func (e *endpoint) Resume(s *stack.Stack) {
 			listenLoading.Done()
 			tcpip.AsyncLoading.Done()
 		}()
-	case epState.connecting():
+	case epState == StateConnecting:
+		// Initial SYN hasn't been sent yet so initiate a connect.
 		tcpip.AsyncLoading.Add(1)
 		go func() {
 			connectedLoading.Wait()
 			listenLoading.Wait()
 			bind()
-			if err := e.Connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.ID.RemotePort}); err != tcpip.ErrConnectStarted {
+			err := e.Connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.TransportEndpointInfo.ID.RemotePort})
+			if _, ok := err.(*tcpip.ErrConnectStarted); !ok {
 				panic("endpoint connecting failed: " + err.String())
 			}
 			connectingLoading.Done()
 			tcpip.AsyncLoading.Done()
 		}()
+	case epState == StateSynSent || epState == StateSynRecv:
+		connectedLoading.Wait()
+		listenLoading.Wait()
+		// Initial SYN has been sent/received so we should bind the
+		// ports start the retransmit timer for the SYNs and let it
+		// naturally complete the connection.
+		bind()
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.setEndpointState(epState)
+		r, err := e.stack.FindRoute(e.boundNICID, e.TransportEndpointInfo.ID.LocalAddress, e.TransportEndpointInfo.ID.RemoteAddress, e.effectiveNetProtos[0], false /* multicastLoop */)
+		if err != nil {
+			panic(fmt.Sprintf("FindRoute failed when restoring endpoint w/ ID: %+v", e.ID))
+		}
+		e.route = r
+		timer, err := newBackoffTimer(e.stack.Clock(), InitialRTO, MaxRTO, maybeFailTimerHandler(e, e.h.retransmitHandlerLocked))
+		if err != nil {
+			panic(fmt.Sprintf("newBackOffTimer(_, %s, %s, _) failed: %s", InitialRTO, MaxRTO, err))
+		}
+		e.h.retransmitTimer = timer
+		connectingLoading.Done()
 	case epState == StateBound:
 		tcpip.AsyncLoading.Add(1)
 		go func() {
@@ -281,68 +260,12 @@ func (e *endpoint) Resume(s *stack.Stack) {
 		}()
 	case epState == StateClose:
 		e.isPortReserved = false
-		e.state = StateClose
+		e.state.Store(uint32(StateClose))
 		e.stack.CompleteTransportEndpointCleanup(e)
 		tcpip.DeleteDanglingEndpoint(e)
 	case epState == StateError:
-		e.state = StateError
+		e.state.Store(uint32(StateError))
 		e.stack.CompleteTransportEndpointCleanup(e)
 		tcpip.DeleteDanglingEndpoint(e)
 	}
-}
-
-// saveLastError is invoked by stateify.
-func (e *endpoint) saveLastError() string {
-	if e.lastError == nil {
-		return ""
-	}
-
-	return e.lastError.String()
-}
-
-// loadLastError is invoked by stateify.
-func (e *endpoint) loadLastError(s string) {
-	if s == "" {
-		return
-	}
-
-	e.lastError = tcpip.StringToError(s)
-}
-
-// saveHardError is invoked by stateify.
-func (e *EndpointInfo) saveHardError() string {
-	if e.HardError == nil {
-		return ""
-	}
-
-	return e.HardError.String()
-}
-
-// loadHardError is invoked by stateify.
-func (e *EndpointInfo) loadHardError(s string) {
-	if s == "" {
-		return
-	}
-
-	e.HardError = tcpip.StringToError(s)
-}
-
-// saveMeasureTime is invoked by stateify.
-func (r *rcvBufAutoTuneParams) saveMeasureTime() unixTime {
-	return unixTime{r.measureTime.Unix(), r.measureTime.UnixNano()}
-}
-
-// loadMeasureTime is invoked by stateify.
-func (r *rcvBufAutoTuneParams) loadMeasureTime(unix unixTime) {
-	r.measureTime = time.Unix(unix.second, unix.nano)
-}
-
-// saveRttMeasureTime is invoked by stateify.
-func (r *rcvBufAutoTuneParams) saveRttMeasureTime() unixTime {
-	return unixTime{r.rttMeasureTime.Unix(), r.rttMeasureTime.UnixNano()}
-}
-
-// loadRttMeasureTime is invoked by stateify.
-func (r *rcvBufAutoTuneParams) loadRttMeasureTime(unix unixTime) {
-	r.rttMeasureTime = time.Unix(unix.second, unix.nano)
 }

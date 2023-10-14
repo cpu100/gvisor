@@ -16,10 +16,7 @@ package devpts
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // Terminal is a pseudoterminal.
@@ -36,85 +33,18 @@ type Terminal struct {
 	// this terminal. This field is immutable.
 	masterKTTY *kernel.TTY
 
-	// slaveKTTY contains the controlling process of the slave end of this
+	// replicaKTTY contains the controlling process of the replica end of this
 	// terminal. This field is immutable.
-	slaveKTTY *kernel.TTY
+	replicaKTTY *kernel.TTY
 }
 
 func newTerminal(n uint32) *Terminal {
-	termios := linux.DefaultSlaveTermios
-	t := Terminal{
-		n:          n,
-		ld:         newLineDiscipline(termios),
-		masterKTTY: &kernel.TTY{Index: n},
-		slaveKTTY:  &kernel.TTY{Index: n},
+	t := &Terminal{
+		n:           n,
+		masterKTTY:  &kernel.TTY{Index: n},
+		replicaKTTY: &kernel.TTY{Index: n},
 	}
-	return &t
-}
+	t.ld = newLineDiscipline(linux.DefaultReplicaTermios, t)
 
-// setControllingTTY makes tm the controlling terminal of the calling thread
-// group.
-func (tm *Terminal) setControllingTTY(ctx context.Context, io usermem.IO, args arch.SyscallArguments, isMaster bool) error {
-	task := kernel.TaskFromContext(ctx)
-	if task == nil {
-		panic("setControllingTTY must be called from a task context")
-	}
-
-	return task.ThreadGroup().SetControllingTTY(tm.tty(isMaster), args[2].Int())
-}
-
-// releaseControllingTTY removes tm as the controlling terminal of the calling
-// thread group.
-func (tm *Terminal) releaseControllingTTY(ctx context.Context, io usermem.IO, args arch.SyscallArguments, isMaster bool) error {
-	task := kernel.TaskFromContext(ctx)
-	if task == nil {
-		panic("releaseControllingTTY must be called from a task context")
-	}
-
-	return task.ThreadGroup().ReleaseControllingTTY(tm.tty(isMaster))
-}
-
-// foregroundProcessGroup gets the process group ID of tm's foreground process.
-func (tm *Terminal) foregroundProcessGroup(ctx context.Context, io usermem.IO, args arch.SyscallArguments, isMaster bool) (uintptr, error) {
-	task := kernel.TaskFromContext(ctx)
-	if task == nil {
-		panic("foregroundProcessGroup must be called from a task context")
-	}
-
-	ret, err := task.ThreadGroup().ForegroundProcessGroup(tm.tty(isMaster))
-	if err != nil {
-		return 0, err
-	}
-
-	// Write it out to *arg.
-	_, err = usermem.CopyObjectOut(ctx, io, args[2].Pointer(), int32(ret), usermem.IOOpts{
-		AddressSpaceActive: true,
-	})
-	return 0, err
-}
-
-// foregroundProcessGroup sets tm's foreground process.
-func (tm *Terminal) setForegroundProcessGroup(ctx context.Context, io usermem.IO, args arch.SyscallArguments, isMaster bool) (uintptr, error) {
-	task := kernel.TaskFromContext(ctx)
-	if task == nil {
-		panic("setForegroundProcessGroup must be called from a task context")
-	}
-
-	// Read in the process group ID.
-	var pgid int32
-	if _, err := usermem.CopyObjectIn(ctx, io, args[2].Pointer(), &pgid, usermem.IOOpts{
-		AddressSpaceActive: true,
-	}); err != nil {
-		return 0, err
-	}
-
-	ret, err := task.ThreadGroup().SetForegroundProcessGroup(tm.tty(isMaster), kernel.ProcessGroupID(pgid))
-	return uintptr(ret), err
-}
-
-func (tm *Terminal) tty(isMaster bool) *kernel.TTY {
-	if isMaster {
-		return tm.masterKTTY
-	}
-	return tm.slaveKTTY
+	return t
 }

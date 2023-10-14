@@ -21,9 +21,10 @@ func (udpPacketElementMapper) linkerFor(elem *udpPacket) *udpPacket { return ele
 // The zero value for List is an empty list ready to use.
 //
 // To iterate over a list (where l is a List):
-//      for e := l.Front(); e != nil; e = e.Next() {
-// 		// do something with e.
-//      }
+//
+//	for e := l.Front(); e != nil; e = e.Next() {
+//		// do something with e.
+//	}
 //
 // +stateify savable
 type udpPacketList struct {
@@ -38,16 +39,22 @@ func (l *udpPacketList) Reset() {
 }
 
 // Empty returns true iff the list is empty.
+//
+//go:nosplit
 func (l *udpPacketList) Empty() bool {
 	return l.head == nil
 }
 
 // Front returns the first element of list l or nil.
+//
+//go:nosplit
 func (l *udpPacketList) Front() *udpPacket {
 	return l.head
 }
 
 // Back returns the last element of list l or nil.
+//
+//go:nosplit
 func (l *udpPacketList) Back() *udpPacket {
 	return l.tail
 }
@@ -55,6 +62,8 @@ func (l *udpPacketList) Back() *udpPacket {
 // Len returns the number of elements in the list.
 //
 // NOTE: This is an O(n) operation.
+//
+//go:nosplit
 func (l *udpPacketList) Len() (count int) {
 	for e := l.Front(); e != nil; e = (udpPacketElementMapper{}.linkerFor(e)).Next() {
 		count++
@@ -63,6 +72,8 @@ func (l *udpPacketList) Len() (count int) {
 }
 
 // PushFront inserts the element e at the front of list l.
+//
+//go:nosplit
 func (l *udpPacketList) PushFront(e *udpPacket) {
 	linker := udpPacketElementMapper{}.linkerFor(e)
 	linker.SetNext(l.head)
@@ -76,7 +87,26 @@ func (l *udpPacketList) PushFront(e *udpPacket) {
 	l.head = e
 }
 
+// PushFrontList inserts list m at the start of list l, emptying m.
+//
+//go:nosplit
+func (l *udpPacketList) PushFrontList(m *udpPacketList) {
+	if l.head == nil {
+		l.head = m.head
+		l.tail = m.tail
+	} else if m.head != nil {
+		udpPacketElementMapper{}.linkerFor(l.head).SetPrev(m.tail)
+		udpPacketElementMapper{}.linkerFor(m.tail).SetNext(l.head)
+
+		l.head = m.head
+	}
+	m.head = nil
+	m.tail = nil
+}
+
 // PushBack inserts the element e at the back of list l.
+//
+//go:nosplit
 func (l *udpPacketList) PushBack(e *udpPacket) {
 	linker := udpPacketElementMapper{}.linkerFor(e)
 	linker.SetNext(nil)
@@ -91,6 +121,8 @@ func (l *udpPacketList) PushBack(e *udpPacket) {
 }
 
 // PushBackList inserts list m at the end of list l, emptying m.
+//
+//go:nosplit
 func (l *udpPacketList) PushBackList(m *udpPacketList) {
 	if l.head == nil {
 		l.head = m.head
@@ -106,6 +138,8 @@ func (l *udpPacketList) PushBackList(m *udpPacketList) {
 }
 
 // InsertAfter inserts e after b.
+//
+//go:nosplit
 func (l *udpPacketList) InsertAfter(b, e *udpPacket) {
 	bLinker := udpPacketElementMapper{}.linkerFor(b)
 	eLinker := udpPacketElementMapper{}.linkerFor(e)
@@ -124,6 +158,8 @@ func (l *udpPacketList) InsertAfter(b, e *udpPacket) {
 }
 
 // InsertBefore inserts e before a.
+//
+//go:nosplit
 func (l *udpPacketList) InsertBefore(a, e *udpPacket) {
 	aLinker := udpPacketElementMapper{}.linkerFor(a)
 	eLinker := udpPacketElementMapper{}.linkerFor(e)
@@ -141,6 +177,8 @@ func (l *udpPacketList) InsertBefore(a, e *udpPacket) {
 }
 
 // Remove removes e from l.
+//
+//go:nosplit
 func (l *udpPacketList) Remove(e *udpPacket) {
 	linker := udpPacketElementMapper{}.linkerFor(e)
 	prev := linker.Prev()
@@ -173,21 +211,29 @@ type udpPacketEntry struct {
 }
 
 // Next returns the entry that follows e in the list.
+//
+//go:nosplit
 func (e *udpPacketEntry) Next() *udpPacket {
 	return e.next
 }
 
 // Prev returns the entry that precedes e in the list.
+//
+//go:nosplit
 func (e *udpPacketEntry) Prev() *udpPacket {
 	return e.prev
 }
 
 // SetNext assigns 'entry' as the entry that follows e in the list.
+//
+//go:nosplit
 func (e *udpPacketEntry) SetNext(elem *udpPacket) {
 	e.next = elem
 }
 
 // SetPrev assigns 'entry' as the entry that precedes e in the list.
+//
+//go:nosplit
 func (e *udpPacketEntry) SetPrev(elem *udpPacket) {
 	e.prev = elem
 }

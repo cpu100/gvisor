@@ -21,7 +21,8 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // Global pipe used by blockUntilNonblockingPipeHasWriter since we can't create
@@ -51,8 +52,25 @@ func blockUntilNonblockingPipeHasWriter(ctx context.Context, fd int32) error {
 		if ok {
 			return nil
 		}
-		if err := sleepBetweenNamedPipeOpenChecks(ctx); err != nil {
-			return err
+		// Delay before trying again.
+		if sleepErr := sleepBetweenNamedPipeOpenChecks(ctx); sleepErr != nil {
+			// Another application thread may have opened this pipe for
+			// writing, succeeded because we previously opened the pipe for
+			// reading, and subsequently interrupted us for checkpointing (e.g.
+			// this occurs in mknod tests under cooperative save/restore). In
+			// this case, our open has to succeed for the checkpoint to include
+			// a readable FD for the pipe, which is in turn necessary to
+			// restore the other thread's writable FD for the same pipe
+			// (otherwise it will get ENXIO). So we have to check
+			// nonblockingPipeHasWriter() once last time.
+			ok, err := nonblockingPipeHasWriter(fd)
+			if err != nil {
+				return err
+			}
+			if ok {
+				return nil
+			}
+			return sleepErr
 		}
 	}
 }
@@ -62,7 +80,7 @@ func nonblockingPipeHasWriter(fd int32) (bool, error) {
 	defer tempPipeMu.Unlock()
 	// Copy 1 byte from fd into the temporary pipe.
 	n, err := unix.Tee(int(fd), tempPipeWriteFD, 1, unix.SPLICE_F_NONBLOCK)
-	if err == syserror.EAGAIN {
+	if linuxerr.Equals(linuxerr.EAGAIN, err) {
 		// The pipe represented by fd is empty, but has a writer.
 		return true, nil
 	}
@@ -83,15 +101,10 @@ func nonblockingPipeHasWriter(fd int32) (bool, error) {
 }
 
 func sleepBetweenNamedPipeOpenChecks(ctx context.Context) error {
-	t := time.NewTimer(100 * time.Millisecond)
-	defer t.Stop()
-	cancel := ctx.SleepStart()
-	select {
-	case <-t.C:
-		ctx.SleepFinish(true)
-		return nil
-	case <-cancel:
-		ctx.SleepFinish(false)
-		return syserror.ErrInterrupted
+	var q waiter.NeverReady
+	left, ok := ctx.BlockWithTimeoutOn(&q, waiter.EventIn, 100*time.Millisecond)
+	if !ok && left != 0 {
+		return linuxerr.ErrInterrupted
 	}
+	return nil
 }

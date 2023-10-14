@@ -16,6 +16,9 @@ package vfs
 
 import (
 	"strings"
+
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
 // GenericParseMountOptions parses a comma-separated list of options of the
@@ -23,7 +26,7 @@ import (
 // returns it as a map. If str contains duplicate keys, then the last value
 // wins. For example:
 //
-// str = "key0=value0,key1,key2=value2,key0=value3" -> map{'key0':'value3','key1':'','key2':'value2'}
+// str = "key0=value0,key1,key2=value2,key0=value3" -> map{'key0':'value3','key1':”,'key2':'value2'}
 //
 // GenericParseMountOptions is not appropriate if values may contain commas,
 // e.g. in the case of the mpol mount option for tmpfs(5).
@@ -40,4 +43,14 @@ func GenericParseMountOptions(str string) map[string]string {
 		}
 	}
 	return m
+}
+
+// GenericStatFS returns a statfs struct filled with the common fields for a
+// general filesystem. This is analogous to Linux's fs/libfs.cs:simple_statfs().
+func GenericStatFS(fsMagic uint64) linux.Statfs {
+	return linux.Statfs{
+		Type:       fsMagic,
+		BlockSize:  hostarch.PageSize,
+		NameLength: linux.NAME_MAX,
+	}
 }

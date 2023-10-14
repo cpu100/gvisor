@@ -15,44 +15,35 @@
 package kernel
 
 import (
-	"syscall"
-
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/bpf"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 const maxSyscallFilterInstructions = 1 << 15
 
-// seccompData is equivalent to struct seccomp_data, which contains the data
-// passed to seccomp-bpf filters.
-type seccompData struct {
-	// nr is the system call number.
-	nr int32
-
-	// arch is an AUDIT_ARCH_* value indicating the system call convention.
-	arch uint32
-
-	// instructionPointer is the value of the instruction pointer at the time
-	// of the system call.
-	instructionPointer uint64
-
-	// args contains the first 6 system call arguments.
-	args [6]uint64
+// dataAsBPFInput returns a serialized BPF program, only valid on the current task
+// goroutine.
+//
+// Note: this is called for every syscall, which is a very hot path.
+func dataAsBPFInput(t *Task, d *linux.SeccompData) bpf.Input {
+	buf := t.CopyScratchBuffer(d.SizeBytes())
+	d.MarshalUnsafe(buf)
+	return bpf.InputBytes{
+		Data: buf,
+		// Go-marshal always uses the native byte order.
+		Order: hostarch.ByteOrder,
+	}
 }
 
-func (d *seccompData) asBPFInput() bpf.Input {
-	return bpf.InputBytes{binary.Marshal(nil, usermem.ByteOrder, d), usermem.ByteOrder}
-}
-
-func seccompSiginfo(t *Task, errno, sysno int32, ip usermem.Addr) *arch.SignalInfo {
-	si := &arch.SignalInfo{
+func seccompSiginfo(t *Task, errno, sysno int32, ip hostarch.Addr) *linux.SignalInfo {
+	si := &linux.SignalInfo{
 		Signo: int32(linux.SIGSYS),
 		Errno: errno,
-		Code:  arch.SYS_SECCOMP,
+		Code:  linux.SYS_SECCOMP,
 	}
 	si.SetCallAddr(uint64(ip))
 	si.SetSyscall(sysno)
@@ -65,7 +56,7 @@ func seccompSiginfo(t *Task, errno, sysno int32, ip usermem.Addr) *arch.SignalIn
 // in because vsyscalls do not use the values in t.Arch().)
 //
 // Preconditions: The caller must be running on the task goroutine.
-func (t *Task) checkSeccompSyscall(sysno int32, args arch.SyscallArguments, ip usermem.Addr) linux.BPFAction {
+func (t *Task) checkSeccompSyscall(sysno int32, args arch.SyscallArguments, ip hostarch.Addr) linux.BPFAction {
 	result := linux.BPFAction(t.evaluateSyscallFilters(sysno, args, ip))
 	action := result & linux.SECCOMP_RET_ACTION
 	switch action {
@@ -91,7 +82,7 @@ func (t *Task) checkSeccompSyscall(sysno int32, args arch.SyscallArguments, ip u
 		// the system call is not executed."
 		if !t.ptraceSeccomp(result.Data()) {
 			// This useless-looking temporary is needed because Go.
-			tmp := uintptr(syscall.ENOSYS)
+			tmp := uintptr(unix.ENOSYS)
 			t.Arch().SetReturn(-tmp)
 			return linux.SECCOMP_RET_ERRNO
 		}
@@ -111,21 +102,21 @@ func (t *Task) checkSeccompSyscall(sysno int32, args arch.SyscallArguments, ip u
 	return action
 }
 
-func (t *Task) evaluateSyscallFilters(sysno int32, args arch.SyscallArguments, ip usermem.Addr) uint32 {
-	data := seccompData{
-		nr:                 sysno,
-		arch:               t.tc.st.AuditNumber,
-		instructionPointer: uint64(ip),
+func (t *Task) evaluateSyscallFilters(sysno int32, args arch.SyscallArguments, ip hostarch.Addr) uint32 {
+	data := linux.SeccompData{
+		Nr:                 sysno,
+		Arch:               t.image.st.AuditNumber,
+		InstructionPointer: uint64(ip),
 	}
 	// data.args is []uint64 and args is []arch.SyscallArgument (uintptr), so
 	// we can't do any slicing tricks or even use copy/append here.
 	for i, arg := range args {
-		if i >= len(data.args) {
+		if i >= len(data.Args) {
 			break
 		}
-		data.args[i] = arg.Uint64()
+		data.Args[i] = arg.Uint64()
 	}
-	input := data.asBPFInput()
+	input := dataAsBPFInput(t, &data)
 
 	ret := uint32(linux.SECCOMP_RET_ALLOW)
 	f := t.syscallFilters.Load()
@@ -185,7 +176,7 @@ func (t *Task) AppendSyscallFilter(p bpf.Program, syncAll bool) error {
 	}
 
 	if totalLength > maxSyscallFilterInstructions {
-		return syserror.ENOMEM
+		return linuxerr.ENOMEM
 	}
 
 	newFilters = append(newFilters, p)

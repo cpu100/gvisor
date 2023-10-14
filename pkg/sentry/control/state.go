@@ -17,6 +17,7 @@ package control
 import (
 	"errors"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/state"
@@ -62,12 +63,13 @@ func (s *State) Save(o *SaveOpts, _ *struct{}) error {
 		Callback: func(err error) {
 			if err == nil {
 				log.Infof("Save succeeded: exiting...")
+				s.Kernel.SetSaveSuccess(false /* autosave */)
 			} else {
 				log.Warningf("Save failed: exiting...")
 				s.Kernel.SetSaveError(err)
 			}
-			s.Kernel.Kill(kernel.ExitStatus{})
+			s.Kernel.Kill(linux.WaitStatusExit(0))
 		},
 	}
-	return saveOpts.Save(s.Kernel, s.Watchdog)
+	return saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog)
 }

@@ -6,23 +6,25 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *Protocol) StateTypeName() string {
+func (p *Protocol) StateTypeName() string {
 	return "pkg/sentry/socket/netlink/route.Protocol"
 }
 
-func (x *Protocol) StateFields() []string {
+func (p *Protocol) StateFields() []string {
 	return []string{}
 }
 
-func (x *Protocol) beforeSave() {}
+func (p *Protocol) beforeSave() {}
 
-func (x *Protocol) StateSave(m state.Sink) {
-	x.beforeSave()
+// +checklocksignore
+func (p *Protocol) StateSave(stateSinkObject state.Sink) {
+	p.beforeSave()
 }
 
-func (x *Protocol) afterLoad() {}
+func (p *Protocol) afterLoad() {}
 
-func (x *Protocol) StateLoad(m state.Source) {
+// +checklocksignore
+func (p *Protocol) StateLoad(stateSourceObject state.Source) {
 }
 
 func init() {

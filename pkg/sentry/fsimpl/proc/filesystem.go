@@ -17,34 +17,50 @@ package proc
 
 import (
 	"fmt"
+	"strconv"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
-// Name is the default filesystem name.
-const Name = "proc"
+const (
+	// Name is the default filesystem name.
+	Name                     = "proc"
+	defaultMaxCachedDentries = uint64(1000)
+)
 
 // FilesystemType is the factory class for procfs.
 //
 // +stateify savable
 type FilesystemType struct{}
 
-var _ vfs.FilesystemType = (*FilesystemType)(nil)
-
 // Name implements vfs.FilesystemType.Name.
 func (FilesystemType) Name() string {
 	return Name
 }
 
+// Release implements vfs.FilesystemType.Release.
+func (FilesystemType) Release(ctx context.Context) {}
+
+// +stateify savable
 type filesystem struct {
 	kernfs.Filesystem
 
 	devMinor uint32
+}
+
+func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linux.Statfs, error) {
+	d, err := fs.GetDentryAt(ctx, rp, vfs.GetDentryOptions{})
+	if err != nil {
+		return linux.Statfs{}, err
+	}
+	d.DecRef(ctx)
+	return vfs.GenericStatFS(linux.PROC_SUPER_MAGIC), nil
 }
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
@@ -61,44 +77,64 @@ func (ft FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualF
 	if err != nil {
 		return nil, nil, err
 	}
+
+	mopts := vfs.GenericParseMountOptions(opts.Data)
+	maxCachedDentries := defaultMaxCachedDentries
+	if str, ok := mopts["dentry_cache_limit"]; ok {
+		delete(mopts, "dentry_cache_limit")
+		maxCachedDentries, err = strconv.ParseUint(str, 10, 64)
+		if err != nil {
+			ctx.Warningf("proc.FilesystemType.GetFilesystem: invalid dentry cache limit: dentry_cache_limit=%s", str)
+			return nil, nil, linuxerr.EINVAL
+		}
+	}
+
 	procfs := &filesystem{
 		devMinor: devMinor,
 	}
+	procfs.MaxCachedDentries = maxCachedDentries
 	procfs.VFSFilesystem().Init(vfsObj, &ft, procfs)
 
-	var cgroups map[string]string
+	var fakeCgroupControllers map[string]string
 	if opts.InternalData != nil {
 		data := opts.InternalData.(*InternalData)
-		cgroups = data.Cgroups
+		fakeCgroupControllers = data.Cgroups
 	}
 
-	_, dentry := procfs.newTasksInode(k, pidns, cgroups)
+	inode := procfs.newTasksInode(ctx, k, pidns, fakeCgroupControllers)
+	var dentry kernfs.Dentry
+	dentry.InitRoot(&procfs.Filesystem, inode)
 	return procfs.VFSFilesystem(), dentry.VFSDentry(), nil
 }
 
 // Release implements vfs.FilesystemImpl.Release.
-func (fs *filesystem) Release() {
+func (fs *filesystem) Release(ctx context.Context) {
 	fs.Filesystem.VFSFilesystem().VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
-	fs.Filesystem.Release()
+	fs.Filesystem.Release(ctx)
+}
+
+// MountOptions implements vfs.FilesystemImpl.MountOptions.
+func (fs *filesystem) MountOptions() string {
+	return fmt.Sprintf("dentry_cache_limit=%d", fs.MaxCachedDentries)
 }
 
 // dynamicInode is an overfitted interface for common Inodes with
 // dynamicByteSource types used in procfs.
+//
+// +stateify savable
 type dynamicInode interface {
 	kernfs.Inode
 	vfs.DynamicBytesSource
 
-	Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, data vfs.DynamicBytesSource, perm linux.FileMode)
+	Init(ctx context.Context, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, data vfs.DynamicBytesSource, perm linux.FileMode)
 }
 
-func (fs *filesystem) newDentry(creds *auth.Credentials, ino uint64, perm linux.FileMode, inode dynamicInode) *kernfs.Dentry {
-	inode.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, ino, inode, perm)
-
-	d := &kernfs.Dentry{}
-	d.Init(inode)
-	return d
+func (fs *filesystem) newInode(ctx context.Context, creds *auth.Credentials, perm linux.FileMode, inode dynamicInode) dynamicInode {
+	inode.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), inode, perm)
+	return inode
 }
 
+// +stateify savable
 type staticFile struct {
 	kernfs.DynamicBytesFile
 	vfs.StaticData
@@ -110,8 +146,24 @@ func newStaticFile(data string) *staticFile {
 	return &staticFile{StaticData: vfs.StaticData{Data: data}}
 }
 
+func (fs *filesystem) newStaticDir(ctx context.Context, creds *auth.Credentials, children map[string]kernfs.Inode) kernfs.Inode {
+	return kernfs.NewStaticDir(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), 0555, children, kernfs.GenericDirectoryFDOptions{
+		SeekEnd: kernfs.SeekEndZero,
+	})
+}
+
 // InternalData contains internal data passed in to the procfs mount via
 // vfs.GetFilesystemOptions.InternalData.
+//
+// +stateify savable
 type InternalData struct {
 	Cgroups map[string]string
+}
+
+// +stateify savable
+type implStatFS struct{}
+
+// StatFS implements kernfs.Inode.StatFS.
+func (*implStatFS) StatFS(context.Context, *vfs.Filesystem) (linux.Statfs, error) {
+	return vfs.GenericStatFS(linux.PROC_SUPER_MAGIC), nil
 }

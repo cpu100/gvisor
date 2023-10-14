@@ -16,18 +16,20 @@
 package timerfd
 
 import (
-	"sync/atomic"
-
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// TimerFileDescription implements FileDescriptionImpl for timer fds. It also
+// TimerFileDescription implements vfs.FileDescriptionImpl for timer fds. It also
 // implements ktime.TimerListener.
+//
+// +stateify savable
 type TimerFileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -40,16 +42,16 @@ type TimerFileDescription struct {
 	// val is the number of timer expirations since the last successful
 	// call to PRead, or SetTime. val must be accessed using atomic memory
 	// operations.
-	val uint64
+	val atomicbitops.Uint64
 }
 
 var _ vfs.FileDescriptionImpl = (*TimerFileDescription)(nil)
-var _ ktime.TimerListener = (*TimerFileDescription)(nil)
+var _ ktime.Listener = (*TimerFileDescription)(nil)
 
 // New returns a new timer fd.
-func New(vfsObj *vfs.VirtualFilesystem, clock ktime.Clock, flags uint32) (*vfs.FileDescription, error) {
+func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, clock ktime.Clock, flags uint32) (*vfs.FileDescription, error) {
 	vd := vfsObj.NewAnonVirtualDentry("[timerfd]")
-	defer vd.DecRef()
+	defer vd.DecRef(ctx)
 	tfd := &TimerFileDescription{}
 	tfd.timer = ktime.NewTimer(clock, tfd)
 	if err := tfd.vfsfd.Init(tfd, flags, vd.Mount(), vd.Dentry(), &vfs.FileDescriptionOptions{
@@ -62,15 +64,15 @@ func New(vfsObj *vfs.VirtualFilesystem, clock ktime.Clock, flags uint32) (*vfs.F
 	return &tfd.vfsfd, nil
 }
 
-// Read implements FileDescriptionImpl.Read.
+// Read implements vfs.FileDescriptionImpl.Read.
 func (tfd *TimerFileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	const sizeofUint64 = 8
 	if dst.NumBytes() < sizeofUint64 {
-		return 0, syserror.EINVAL
+		return 0, linuxerr.EINVAL
 	}
-	if val := atomic.SwapUint64(&tfd.val, 0); val != 0 {
+	if val := tfd.val.Swap(0); val != 0 {
 		var buf [sizeofUint64]byte
-		usermem.ByteOrder.PutUint64(buf[:], val)
+		hostarch.ByteOrder.PutUint64(buf[:], val)
 		if _, err := dst.CopyOut(ctx, buf[:]); err != nil {
 			// Linux does not undo consuming the number of
 			// expirations even if writing to userspace fails.
@@ -78,7 +80,7 @@ func (tfd *TimerFileDescription) Read(ctx context.Context, dst usermem.IOSequenc
 		}
 		return sizeofUint64, nil
 	}
-	return 0, syserror.ErrWouldBlock
+	return 0, linuxerr.ErrWouldBlock
 }
 
 // Clock returns the timer fd's Clock.
@@ -96,26 +98,32 @@ func (tfd *TimerFileDescription) GetTime() (ktime.Time, ktime.Setting) {
 // of expirations to 0, and returns the previous setting and the time at which
 // it was observed.
 func (tfd *TimerFileDescription) SetTime(s ktime.Setting) (ktime.Time, ktime.Setting) {
-	return tfd.timer.SwapAnd(s, func() { atomic.StoreUint64(&tfd.val, 0) })
+	return tfd.timer.SwapAnd(s, func() { tfd.val.Store(0) })
 }
 
 // Readiness implements waiter.Waitable.Readiness.
 func (tfd *TimerFileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
 	var ready waiter.EventMask
-	if atomic.LoadUint64(&tfd.val) != 0 {
-		ready |= waiter.EventIn
+	if tfd.val.Load() != 0 {
+		ready |= waiter.ReadableEvents
 	}
 	return ready
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (tfd *TimerFileDescription) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	tfd.events.EventRegister(e, mask)
+func (tfd *TimerFileDescription) EventRegister(e *waiter.Entry) error {
+	tfd.events.EventRegister(e)
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (tfd *TimerFileDescription) EventUnregister(e *waiter.Entry) {
 	tfd.events.EventUnregister(e)
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (tfd *TimerFileDescription) Epollable() bool {
+	return true
 }
 
 // PauseTimer pauses the associated Timer.
@@ -128,17 +136,14 @@ func (tfd *TimerFileDescription) ResumeTimer() {
 	tfd.timer.Resume()
 }
 
-// Release implements FileDescriptionImpl.Release()
-func (tfd *TimerFileDescription) Release() {
+// Release implements vfs.FileDescriptionImpl.Release.
+func (tfd *TimerFileDescription) Release(context.Context) {
 	tfd.timer.Destroy()
 }
 
-// Notify implements ktime.TimerListener.Notify.
-func (tfd *TimerFileDescription) Notify(exp uint64, setting ktime.Setting) (ktime.Setting, bool) {
-	atomic.AddUint64(&tfd.val, exp)
-	tfd.events.Notify(waiter.EventIn)
+// NotifyTimer implements ktime.TimerListener.NotifyTimer.
+func (tfd *TimerFileDescription) NotifyTimer(exp uint64, setting ktime.Setting) (ktime.Setting, bool) {
+	tfd.val.Add(exp)
+	tfd.events.Notify(waiter.ReadableEvents)
 	return ktime.Setting{}, false
 }
-
-// Destroy implements ktime.TimerListener.Destroy.
-func (tfd *TimerFileDescription) Destroy() {}
