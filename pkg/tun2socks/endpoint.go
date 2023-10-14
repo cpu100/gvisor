@@ -12,7 +12,7 @@ import (
 )
 
 // 1500 - ipHeader - tcpHeader - tcpTimestamp - packetCustomHeader
-const PAYLOAD = 1500 - 20 - 20 - 12 - 10
+const PAYLOAD = 1500 - 20 - 20 - 12 - 8
 const MTU = PAYLOAD + 20 + 20
 
 type endpoint struct {
