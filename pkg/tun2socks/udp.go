@@ -6,13 +6,13 @@ import (
     "net"
     "time"
 
+    "gvisor.dev/gvisor/pkg/buffer"
     "gvisor.dev/gvisor/pkg/tcpip"
-    "gvisor.dev/gvisor/pkg/tcpip/buffer"
     "gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
 type UDPConn struct {
-    ch chan buffer.View
+    ch chan *buffer.View
     ep tcpip.Endpoint
 
     t2s *Tun2socks
@@ -23,7 +23,7 @@ type UDPConn struct {
 }
 
 func (conn *UDPConn) WriteTo(w io.Writer) (n int64, e error) {
-    var v buffer.View
+    var v *buffer.View
     var rTimer = time.NewTimer(time.Second*5)
     defer rTimer.Stop()
     for {
@@ -45,8 +45,8 @@ func (conn *UDPConn) WriteTo(w io.Writer) (n int64, e error) {
             }
             return
         }
-        for len(v) > 0 {
-            nw, err := w.Write(v)
+        for v.Size() > 0 {
+            nw, err := w.Write(v.AsSlice())
             if nil != err {
                 if err2, ok := err.(net.Error); !ok || !err2.Temporary() {
                     e = err
@@ -115,7 +115,7 @@ func (conn *UDPConn) Close() error {
 func (conn *UDPConn) LocalAddr() net.Addr {
     id := udp.TransportEndpointID(conn.ep)
     return &net.UDPAddr{
-        IP:   []byte(id.RemoteAddress),
+        IP:   id.RemoteAddress.AsSlice(),
         Port: int(id.RemotePort),
     }
 }
@@ -123,7 +123,7 @@ func (conn *UDPConn) LocalAddr() net.Addr {
 func (conn *UDPConn) RemoteAddr() net.Addr {
     id := udp.TransportEndpointID(conn.ep)
     return &net.UDPAddr{
-        IP:   []byte(id.LocalAddress),
+        IP:   id.LocalAddress.AsSlice(),
         Port: int(id.LocalPort),
     }
 }

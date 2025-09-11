@@ -156,8 +156,8 @@ func EndpointWithWriteOptions(e tcpip.Endpoint, id *stack.TransportEndpointID) *
 	}
 }
 
-func Write(e tcpip.Endpoint, v buffer.View) (int64, <-chan struct{}, *tcpip.Error) {
-	return e.Write(tcpip.SlicePayload(v), e.(*endpoint).writeOptions)
+func Write(e tcpip.Endpoint, payloader tcpip.Payloader) (int64, tcpip.Error) {
+	return e.Write(payloader, e.(*endpoint).writeOptions)
 }
 
 func TransportEndpointID(e tcpip.Endpoint) *stack.TransportEndpointID {
@@ -991,9 +991,8 @@ func (e *endpoint) HandlePacket(id stack.TransportEndpointID, pkt stack.PacketBu
 	packet := &udpPacket{
 		netProto: pkt.NetworkProtocolNumber,
 		senderAddress: tcpip.FullAddress{
-			// Return destination address without changing the interface.
-			NIC:  tcpip.NICID(hdr.DestinationPort()),
-			Addr: id.RemoteAddress + id.LocalAddress,
+			NIC:  pkt.NICID,
+			Addr: id.RemoteAddress,
 			Port: hdr.SourcePort(),
 		},
 		destinationAddress: tcpip.FullAddress{

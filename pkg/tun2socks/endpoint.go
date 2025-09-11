@@ -4,8 +4,9 @@ import (
     "io"
     "log"
 
+    "gvisor.dev/gvisor/pkg/buffer"
     "gvisor.dev/gvisor/pkg/tcpip"
-    "gvisor.dev/gvisor/pkg/tcpip/buffer"
+    "gvisor.dev/gvisor/pkg/tcpip/header"
     "gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
     "gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
     "gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -17,6 +18,18 @@ const MTU = PAYLOAD + 20 + 20
 
 type endpoint struct {
     tun io.ReadWriteCloser
+}
+
+func (e *endpoint) ARPHardwareType() header.ARPHardwareType {
+    panic(ErrNotSupported)
+}
+
+func (e *endpoint) AddHeader(ptr stack.PacketBufferPtr) {
+    // panic(ErrNotSupported)
+}
+
+func (e *endpoint) ParseHeader(ptr stack.PacketBufferPtr) bool {
+    panic(ErrNotSupported)
 }
 
 func (e *endpoint) MTU() uint32 {
@@ -39,33 +52,26 @@ func (e *endpoint) LinkAddress() tcpip.LinkAddress {
     return "\xFE\xFF\xFF\xFF\xFF\xFF"
 }
 
-func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
-    vv := pkt.Header.View().ToVectorisedView()
-    vv.Append(pkt.Data)
-    nw, err := e.tun.Write(vv.ToView())
-    if nil != err {
-        log.Println(err)
-        return tcpip.ErrInvalidEndpointState
-    } else if nw != vv.Size() {
-        panic(io.ErrShortWrite)
-    } else {
-        return nil
+func (e *endpoint) WritePackets(list stack.PacketBufferList) (n int, err tcpip.Error) {
+    for _, pb := range list.AsSlice() {
+        nw, err := e.tun.Write(pb.ToView().AsSlice())
+        if nil != err {
+            log.Println(err)
+            return n, &tcpip.ErrInvalidEndpointState{}
+        } else if nw != pb.Size() {
+            panic(io.ErrShortWrite)
+        }
+        n += pb.Size()
+        // pb.DecRef()
     }
-}
-
-func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
-    panic(ErrNotSupported)
-}
-
-func (e *endpoint) WriteRawPacket(vv buffer.VectorisedView) *tcpip.Error {
-    panic(ErrNotSupported)
+    return
 }
 
 func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
     go func(tun io.Reader) {
         for {
-            v := buffer.NewView(MTU)
-            nr, err := tun.Read(v)
+            v := buffer.NewViewSize(MTU)
+            nr, err := tun.Read(v.AsSlice())
             if nil != err {
                 log.Println(err)
                 break
@@ -73,17 +79,20 @@ func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 
             v.CapLength(nr)
 
-            if 0x40 == v[0]&0xf0 {
-                dispatcher.DeliverNetworkPacket("", "", ipv4.ProtocolNumber, &stack.PacketBuffer{
-                    Data: v.ToVectorisedView(),
-                })
+            pb := stack.NewPacketBuffer(stack.PacketBufferOptions{
+                Payload: buffer.MakeWithView(v),
+                OnRelease: func() {
+                    // log.Println("test ok OnRelease")
+                }})
+
+            if 0x40 == v.AsSlice()[0]&0xf0 {
+                dispatcher.DeliverNetworkPacket(ipv4.ProtocolNumber, pb)
             } else {
                 // https://en.wikipedia.org/wiki/List_of_IP_Protocol_numbers
                 // header.IPv6(v).TransportProtocol() == header.ICMPv6ProtocolNumber
-                dispatcher.DeliverNetworkPacket("", "", ipv6.ProtocolNumber, &stack.PacketBuffer{
-                    Data: v.ToVectorisedView(),
-                })
+                dispatcher.DeliverNetworkPacket(ipv6.ProtocolNumber, pb)
             }
+            pb.DecRef()
         }
     }(e.tun)
 }

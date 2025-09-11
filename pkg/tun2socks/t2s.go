@@ -6,8 +6,9 @@ import (
     "runtime"
     "sync"
 
+    "gvisor.dev/gvisor/pkg/buffer"
     "gvisor.dev/gvisor/pkg/tcpip"
-    "gvisor.dev/gvisor/pkg/tcpip/buffer"
+    "gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
     "gvisor.dev/gvisor/pkg/tcpip/header"
     "gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
     "gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -26,22 +27,33 @@ type Tun2socks struct {
 
 func New(tun io.ReadWriteCloser, th TransportHandler) *Tun2socks {
 
+    log.SetFlags(log.LstdFlags | log.Lshortfile)
+
     s := stack.New(stack.Options{
-        NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol(), ipv6.NewProtocol()},
-        TransportProtocols: []stack.TransportProtocol{tcp.NewProtocol(), udp.NewProtocol()},
+        // icmp.NewProtocol4,
+        NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+        TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
     })
 
     if err := s.CreateNIC(1, &endpoint{tun: tun}); err != nil {
         panic(err)
     }
 
-    if err := s.AddAddressRange(1, ipv4.ProtocolNumber, header.IPv4EmptySubnet); err != nil {
+    if err := s.AddProtocolAddress(1, tcpip.ProtocolAddress{ipv4.ProtocolNumber, tcpip.AddressWithPrefix{tcpip.AddrFrom4([4]byte{111,230,9,178}), 32}}, stack.AddressProperties{}); err != nil {
         panic(err)
     }
 
-    if err := s.AddAddressRange(1, ipv6.ProtocolNumber, header.IPv6EmptySubnet); err != nil {
-        panic(err)
-    }
+    // if err := s.AddProtocolAddress(1, tcpip.ProtocolAddress{ipv4.ProtocolNumber, tcpip.AddressWithPrefix{header.IPv4Any, 0}}, stack.AddressProperties{}); err != nil {
+    //     panic(err)
+    // }
+
+    // if err := s.AddProtocolAddress(1, tcpip.ProtocolAddress{ipv6.ProtocolNumber, tcpip.AddressWithPrefix{header.IPv6Any, 0}}, stack.AddressProperties{}); err != nil {
+    //     panic(err)
+    // }
+
+    // s.AddAddressRange(1, ipv4.ProtocolNumber, header.IPv4EmptySubnet)
+    // s.AddAddressRange(1, ipv6.ProtocolNumber, header.IPv6EmptySubnet)
+    s.SetPromiscuousMode(1, true)
 
     // a default route is required by udp sending
     s.SetRouteTable([]tcpip.Route{
@@ -53,8 +65,8 @@ func New(tun io.ReadWriteCloser, th TransportHandler) *Tun2socks {
 
     t2s.tcpAccept(ipv4.ProtocolNumber)
     t2s.tcpAccept(ipv6.ProtocolNumber)
-    t2s.udpAccept(ipv4.ProtocolNumber)
-    t2s.udpAccept(ipv6.ProtocolNumber)
+    // t2s.udpAccept(ipv4.ProtocolNumber)
+    // t2s.udpAccept(ipv6.ProtocolNumber)
 
     return t2s
 }
@@ -76,13 +88,13 @@ func (t2s *Tun2socks) tcpAccept(netProto tcpip.NetworkProtocolNumber) {
     }
 
     go func() {
-        waitEntry, notifyCh := waiter.NewChannelEntry(nil)
-        wq.EventRegister(&waitEntry, waiter.EventIn|waiter.EventErr)
+        waitEntry, notifyCh := waiter.NewChannelEntry(waiter.EventErr|waiter.ReadableEvents)
+        wq.EventRegister(&waitEntry)
         defer wq.EventUnregister(&waitEntry)
         for {
-            ep2, wq2, err := ep.Accept()
+            ep2, wq2, err := ep.Accept(nil)
             if err != nil {
-                if err == tcpip.ErrWouldBlock {
+                if _, ok := err.(*tcpip.ErrWouldBlock); ok {
                     <-notifyCh
                     continue
                 } else {
@@ -103,26 +115,32 @@ func (t2s *Tun2socks) udpAccept(netProto tcpip.NetworkProtocolNumber) {
         panic(err)
     }
 
+    // 好像并未发送 RemoteAddress 是缺失的
     if err := ep.Bind(tcpip.FullAddress{NIC: 1, Port: uint16(netProto)}); err != nil {
         panic(err)
     }
 
+    // ep.Accept() 是可以用的吗
+
     go func() {
-        waitEntry, notifyCh := waiter.NewChannelEntry(nil)
-        wq.EventRegister(&waitEntry, waiter.EventIn|waiter.EventErr)
+        waitEntry, notifyCh := waiter.NewChannelEntry(waiter.EventIn|waiter.EventErr)
+        wq.EventRegister(&waitEntry)
         defer wq.EventUnregister(&waitEntry)
 
-        var ipLen = header.IPv4AddressSize
-        if ipv6.ProtocolNumber == netProto {
-            ipLen = header.IPv6AddressSize
-        }
+        // var ipLen = header.IPv4AddressSize
+        // if ipv6.ProtocolNumber == netProto {
+        //     ipLen = header.IPv6AddressSize
+        // }
 
-        var chView chan buffer.View
-        var addr = tcpip.FullAddress{}
+         v := buffer.NewView(MTU*2)
+        var chView chan *buffer.View
+        // var addr = tcpip.FullAddress{}
         for {
-            v, _, err := ep.Read(&addr)
+            res, err := ep.Read(v, tcpip.ReadOptions{
+                NeedRemoteAddr: true,
+            })
             if err != nil {
-                if err == tcpip.ErrWouldBlock {
+                if _, ok := err.(*tcpip.ErrWouldBlock); ok {
                     <-notifyCh
                     continue
                 } else {
@@ -132,18 +150,21 @@ func (t2s *Tun2socks) udpAccept(netProto tcpip.NetworkProtocolNumber) {
             }
 
             id := stack.TransportEndpointID{
-                RemoteAddress: addr.Addr[:ipLen],
-                RemotePort:    addr.Port,
-                LocalAddress:  addr.Addr[ipLen:],
-                LocalPort:     uint16(addr.NIC),
+                // RemoteAddress: addr.Addr[:ipLen],
+                // RemotePort:    addr.Port,
+                RemoteAddress: res.RemoteAddr.Addr,
+                RemotePort: res.RemoteAddr.Port,
+                // LocalAddress:  addr.Addr[ipLen:],
+                // LocalPort:     uint16(addr.NIC),
             }
 
             if ch, ok := t2s.udpViews.Load(id); ok {
-                chView = ch.(chan buffer.View)
+                chView = ch.(chan *buffer.View)
             } else {
-                actual, loaded := t2s.udpViews.LoadOrStore(id, make(chan buffer.View, 8))
-                chView = actual.(chan buffer.View)
+                actual, loaded := t2s.udpViews.LoadOrStore(id, make(chan *buffer.View, 8))
+                chView = actual.(chan *buffer.View)
                 if !loaded {
+                    // 好像不对，多个read?
                     go t2s.udpConnect(udp.EndpointWithWriteOptions(ep, &id), chView)
                 }
             }
@@ -155,20 +176,22 @@ func (t2s *Tun2socks) udpAccept(netProto tcpip.NetworkProtocolNumber) {
 }
 
 func (t2s *Tun2socks) tcpConnect(wq *waiter.Queue, ep tcpip.Endpoint) {
-    conn := &TCPConn{wq: wq, ep: ep}
+    // conn := &TCPConn{wq: wq, ep: ep}
+    conn := gonet.NewTCPConn(wq, ep)
     if nil != t2s.th.TcpHandle(conn) {
         conn.Close()
     } else {
-        runtime.SetFinalizer(conn, (*TCPConn).Close)
+        runtime.SetFinalizer(conn, (*gonet.TCPConn).Close)
     }
 }
 
-func (t2s *Tun2socks) udpConnect(ep tcpip.Endpoint, ch chan buffer.View) {
+func (t2s *Tun2socks) udpConnect(ep tcpip.Endpoint, ch chan *buffer.View) {
     conn := &UDPConn{ep: ep, ch: ch, t2s: t2s}
+    // conn := gonet.NewUDPConn(t2s.s, )
     if nil != t2s.th.UdpHandle(conn) {
         conn.Close()
     } else {
-        runtime.SetFinalizer(conn, (*UDPConn).Close)
+        runtime.SetFinalizer(conn, (*gonet.UDPConn).Close)
     }
 }
 
@@ -176,7 +199,8 @@ func (t2s *Tun2socks) Close() error {
     t2s.s.Close()
     t2s.s.Wait()
     t2s.udpViews.Range(func(_, ch interface{}) bool {
-        ch.(chan buffer.View) <- nil
+        // ch.(chan any) <- buffer.View{} // close
+        ch.(chan any) <- nil // close
         return true
     })
     return nil

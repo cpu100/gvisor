@@ -1,13 +1,13 @@
 package tun2socks
 
 import (
+    "fmt"
     "io"
     "log"
     "net"
     "time"
 
     "gvisor.dev/gvisor/pkg/tcpip"
-    "gvisor.dev/gvisor/pkg/tcpip/buffer"
     "gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
     "gvisor.dev/gvisor/pkg/waiter"
 )
@@ -18,52 +18,49 @@ type TCPConn struct {
 }
 
 func (conn *TCPConn) WriteTo(w io.Writer) (n int64, e error) {
-    waitEntry, notifyCh := waiter.NewChannelEntry(nil)
-    conn.wq.EventRegister(&waitEntry, waiter.EventIn|waiter.EventErr)
+    waitEntry, notifyCh := waiter.NewChannelEntry(waiter.EventIn|waiter.EventErr)
+    conn.wq.EventRegister(&waitEntry)
     defer conn.wq.EventUnregister(&waitEntry)
 
     var rTimer = time.NewTimer(time.Second)
 
     for {
-        v, _, err := conn.ep.Read(nil)
-        for len(v) > 0 {
-            nw, e2 := w.Write(v)
-            if nil != e2 {
-                if e3, ok := e2.(net.Error); !ok || !e3.Temporary() {
-                    conn.ep.Shutdown(tcpip.ShutdownRead)
-                    e = e2
-                    return
-                }
+        res, err := conn.ep.Read(w, tcpip.ReadOptions{})
+        n += int64(res.Count)
+        if err == nil {
+            continue
+        } else if _, ok := err.(*tcpip.ErrWouldBlock); ok {
+            timerReset(rTimer, time.Second)
+            select {
+            case <-notifyCh:
+                continue
+            case <-rTimer.C:
+                e = ErrTimeout
             }
-            n += int64(nw)
-            v.TrimFront(nw)
-        }
-        if err != nil {
-            switch err {
-            case tcpip.ErrWouldBlock:
-                timerReset(rTimer, time.Second)
-                select {
-                case <-notifyCh:
-                    continue
-                case <-rTimer.C:
-                    e = ErrTimeout
-                }
-            case tcpip.ErrClosedForReceive:
-            case tcpip.ErrConnectionReset, tcpip.ErrConnectionAborted:
-                e = ErrClosedPipe
-            default:
-                e = ErrClosedPipe
-                log.Println(err)
+        } else if err2, ok := err.(net.Error); ok {
+            // 可能代码永远都不会走这里 todo
+            if err2.Temporary() {
+                continue
+            } else {
+                e = err2
+                conn.ep.Shutdown(tcpip.ShutdownRead)
             }
-
-            return
+        } else if _, ok := err.(*tcpip.ErrClosedForReceive); ok {
+        } else if _, ok := err.(*tcpip.ErrConnectionReset); ok {
+            e = ErrClosedPipe
+        } else if _, ok := err.(*tcpip.ErrConnectionAborted); ok {
+            e = ErrClosedPipe
+        } else {
+            e = ErrClosedPipe
+            log.Println(err)
         }
+        return
     }
 }
 
 func (conn *TCPConn) ReadFrom(r io.Reader) (n int64, e error) {
-    waitEntry, notifyCh := waiter.NewChannelEntry(nil)
-    conn.wq.EventRegister(&waitEntry, waiter.EventOut|waiter.EventErr)
+    waitEntry, notifyCh := waiter.NewChannelEntry(waiter.EventErr|waiter.WritableEvents)
+    conn.wq.EventRegister(&waitEntry)
     defer conn.wq.EventUnregister(&waitEntry)
 
     for {
@@ -119,7 +116,7 @@ func (conn *TCPConn) Close() error {
 func (conn *TCPConn) LocalAddr() net.Addr {
     id := tcp.TransportEndpointID(conn.ep)
     return &net.TCPAddr{
-        IP:   []byte(id.RemoteAddress),
+        IP:   id.RemoteAddress.AsSlice(),
         Port: int(id.RemotePort),
     }
 }
@@ -127,7 +124,7 @@ func (conn *TCPConn) LocalAddr() net.Addr {
 func (conn *TCPConn) RemoteAddr() net.Addr {
     id := tcp.TransportEndpointID(conn.ep)
     return &net.TCPAddr{
-        IP:   []byte(id.LocalAddress),
+        IP:   id.LocalAddress.AsSlice(),
         Port: int(id.LocalPort),
     }
 }

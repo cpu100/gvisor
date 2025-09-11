@@ -103,7 +103,7 @@ func (eps *transportEndpoints) iterEndpointsLocked(id TransportEndpointID, yield
 	nid.LocalAddress = tcpip.Address{}
 
 	// Match tun2socks endpoint (listen on any ip any port).
-	if len(id.RemoteAddress) == 4 {
+	if id.RemoteAddress.Len() == 4 {
 		nid.LocalPort = uint16(header.IPv4ProtocolNumber)
 	} else {
 		nid.LocalPort = uint16(header.IPv6ProtocolNumber)
